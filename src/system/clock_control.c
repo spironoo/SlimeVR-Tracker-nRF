@@ -41,7 +41,7 @@ LOG_MODULE_REGISTER(clock_switch, LOG_LEVEL_INF);
  */
 
 #define LFCLK_POLL_STEP_US 50
-#define LFCLK_STOP_TIMEOUT_US 100000 /* 100 ms */
+#define LFCLK_STOP_TIMEOUT_US 10000 /* 10 ms: a real stop takes microseconds */
 #define LFCLK_RC_START_TIMEOUT_US 100000 /* 100 ms; RC typically starts in <1 ms */
 /* Crystal LFXO startup is typically ~250 ms and can approach 1 s */
 #define LFCLK_EXT_START_TIMEOUT_US 1000000 /* 1 s */
@@ -63,10 +63,10 @@ static inline nrf_clock_lfclk_t normalize_source(nrf_clock_lfclk_t source)
 {
 	/* XTAL_FULL_SWING and XTAL_LOW_SWING report as XTAL in actual source */
 	if (false
-#ifdef NRF_CLOCK_LFCLK_XTAL_FULL_SWING
+#if defined(NRF_CLOCK_USE_EXTERNAL_LFCLK_SOURCES)
 		|| source == NRF_CLOCK_LFCLK_XTAL_FULL_SWING
 #endif
-#ifdef NRF_CLOCK_LFCLK_XTAL_LOW_SWING
+#if defined(NRF_CLOCK_USE_EXTERNAL_LFCLK_SOURCES)
 		|| source == NRF_CLOCK_LFCLK_XTAL_LOW_SWING
 #endif
 	) {
@@ -109,7 +109,12 @@ static void lfclk_stop_bounded(void)
 	uint32_t waited_us = 0;
 	while (lfclk_running_source_get(NULL)) {
 		if (waited_us >= LFCLK_STOP_TIMEOUT_US) {
-			LOG_ERR("clock_switch: LFCLK did not stop");
+			/* Expected whenever the hardware watchdog is running: the
+			 * nRF52 WDT forces the 32.768 kHz RC oscillator on while no
+			 * other LF source runs, so LFCLKSTOP is held off. Not a
+			 * problem: the source can still be changed by programming
+			 * LFCLKSRC and triggering LFCLKSTART while running. */
+			LOG_INF("clock_switch: LFCLK held running (WDT active); switching source in place");
 			return;
 		}
 		lfclk_cpu_delay_us(LFCLK_POLL_STEP_US);
@@ -157,10 +162,10 @@ bool clock_switch(nrf_clock_lfclk_t source)
 	 * Note: switching to RC is always safe.
 	 */
 	bool xtal_source = source == NRF_CLOCK_LFCLK_XTAL;
-#ifdef NRF_CLOCK_LFCLK_XTAL_FULL_SWING
+#if defined(NRF_CLOCK_USE_EXTERNAL_LFCLK_SOURCES)
 	xtal_source = xtal_source || source == NRF_CLOCK_LFCLK_XTAL_FULL_SWING;
 #endif
-#ifdef NRF_CLOCK_LFCLK_XTAL_LOW_SWING
+#if defined(NRF_CLOCK_USE_EXTERNAL_LFCLK_SOURCES)
 	xtal_source = xtal_source || source == NRF_CLOCK_LFCLK_XTAL_LOW_SWING;
 #endif
 	if (!IS_ENABLED(CONFIG_CLOCK_USE_LFXO) && xtal_source) {
@@ -228,7 +233,7 @@ void clock_init_external(void)
 #if defined(NRF_CLOCK_USE_EXTERNAL_LFCLK_SOURCES) || defined(__NRFX_DOXYGEN__)
 	if (IS_ENABLED(CONFIG_CLOCK_USE_LFXO)) {
 		nrf_clock_lfclk_t source = NRF_CLOCK_LFCLK_XTAL;
-#ifdef NRF_CLOCK_LFCLK_XTAL_FULL_SWING
+#if defined(NRF_CLOCK_USE_EXTERNAL_LFCLK_SOURCES)
 		if (IS_ENABLED(CONFIG_CLOCK_LFXO_FULL_SWING)) {
 			/* XL1 is driven by an active oscillator (rail-to-rail square
 			 * wave), not a crystal: use external full-swing (bypass) mode */
