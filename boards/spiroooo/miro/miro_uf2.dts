@@ -137,6 +137,16 @@
 
 &gpio0 {
 	status = "okay";
+
+	/* Drive the external 32.768 kHz oscillator enable (clk-gpios, P0.30)
+	 * high from GPIO driver init onward, so the LF clock source is already
+	 * running when the firmware later switches LFCLK to it. Runtime code
+	 * (set_sensor_clock) still toggles this pin for sleep. */
+	sensor_clk_en: sensor_clk_en {
+		gpio-hog;
+		gpios = <30 GPIO_ACTIVE_HIGH>;
+		output-high;
+	};
 };
 
 &gpio1 {

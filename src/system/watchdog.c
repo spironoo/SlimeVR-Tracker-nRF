@@ -11,6 +11,7 @@
 
 #include "watchdog.h"
 #include "globals.h"
+#include "system/dfu_diag.h"
 #include <zephyr/task_wdt/task_wdt.h>
 #include <zephyr/drivers/watchdog.h>
 #include <zephyr/device.h>
@@ -140,6 +141,10 @@ static void enter_dfu_mode(void)
 {
 	LOG_WRN("WDT reset count reached threshold (%d), entering DFU mode",
 		WATCHDOG_RESET_THRESHOLD);
+
+	/* Persist why we are entering DFU so the next boot can report it */
+	dfu_diag_record(DFU_DIAG_REASON_WATCHDOG,
+			retained ? retained->watchdog_state.last_failed_channel : 0xFF);
 
 	/* Clear reset counter BEFORE entering DFU to prevent looping back into DFU
 	 * when bootloader times out and returns to firmware.

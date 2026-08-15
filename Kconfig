@@ -570,6 +570,17 @@ config CLOCK_USE_LFXO
         LFXO crystal. Using LFXO without a crystal will cause the
         system to hang or IMU detection to fail.
 
+config CLOCK_LFXO_FULL_SWING
+    bool "LFXO pin is driven by an external full-swing clock"
+    depends on CLOCK_USE_LFXO
+    default n
+    help
+        Select this when XL1 is driven by an active oscillator producing a
+        rail-to-rail 32.768 kHz square wave (external full-swing / bypass
+        mode) instead of a crystal across XL1/XL2. Leave disabled for a
+        real crystal. Selecting the wrong mode can prevent the LF clock
+        from starting or degrade its accuracy.
+
 config CONNECTION_TDMA
     bool "Enable TDMA transmit scheduling"
     default n if !CLOCK_USE_LFXO

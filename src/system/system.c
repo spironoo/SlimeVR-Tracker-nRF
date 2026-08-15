@@ -16,6 +16,7 @@
 #include <hal/nrf_gpio.h>
 
 #include "system.h"
+#include "dfu_diag.h"
 #include "battery_tracker.h"
 #include "build_defines.h"
 
@@ -740,6 +741,8 @@ void sys_reset_mode(uint8_t mode)
 	case 6: // Reset mode DFU
 #endif
 		LOG_INF("DFU requested");
+		/* Persist why we are entering DFU so the next boot can report it */
+		dfu_diag_record(DFU_DIAG_REASON_REQUEST, 0);
 #if ADAFRUIT_BOOTLOADER
 		NRF_POWER->GPREGRET = ADAFRUIT_DFU_MAGIC_UF2_RESET;
 		sys_request_system_reboot(false);
@@ -751,6 +754,8 @@ void sys_reset_mode(uint8_t mode)
 	case 7:
 	case 8: // Reset mode DFU OTA
 		LOG_INF("DFU OTA requested");
+		/* Persist why we are entering DFU so the next boot can report it */
+		dfu_diag_record(DFU_DIAG_REASON_REQUEST, 1);
 #if ADAFRUIT_BOOTLOADER
 		NRF_POWER->GPREGRET = ADAFRUIT_DFU_MAGIC_OTA_RESET;
 		sys_request_system_reboot(false);
