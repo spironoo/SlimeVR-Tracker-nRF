@@ -23,6 +23,3 @@ CONFIG_CLOCK_LFXO_FULL_SWING=y
 # nRF52833 UF2 family ID so the Adafruit bootloader accepts drag-and-drop images
 CONFIG_BUILD_OUTPUT_UF2_FAMILY_ID="0x621E937A"
 
-# P0.09 (green LED) is an NFC pin; release it as GPIO. Note: the first boot
-# after a full chip erase writes UICR and performs one extra reset.
-CONFIG_NFCT_PINS_AS_GPIOS=y

@@ -1,0 +1,507 @@
+diff --git a/Kconfig b/Kconfig
+index 8e56ecb..b26f9e4 100644
+--- a/Kconfig
++++ b/Kconfig
+@@ -510,6 +510,17 @@ config CLOCK_USE_LFXO
+         LFXO crystal. Using LFXO without a crystal will cause the
+         system to hang or IMU detection to fail.
+ 
++config CLOCK_LFXO_FULL_SWING
++    bool "LFXO pin is driven by an external full-swing clock"
++    depends on CLOCK_USE_LFXO
++    default n
++    help
++        Select this when XL1 is driven by an active oscillator producing a
++        rail-to-rail 32.768 kHz square wave (external full-swing / bypass
++        mode) instead of a crystal across XL1/XL2. Leave disabled for a
++        real crystal. Selecting the wrong mode can prevent the LF clock
++        from starting or degrade its accuracy.
++
+ config CONNECTION_TDMA
+     bool "Enable TDMA transmit scheduling"
+     default n if !CLOCK_USE_LFXO
+diff --git a/boards/spiroooo/miro/miro_uf2.dts b/boards/spiroooo/miro/miro_uf2.dts
+index 10a3b94..fbdf42a 100644
+--- a/boards/spiroooo/miro/miro_uf2.dts
++++ b/boards/spiroooo/miro/miro_uf2.dts
+@@ -137,6 +137,16 @@
+ 
+ &gpio0 {
+ 	status = "okay";
++
++	/* Drive the external 32.768 kHz oscillator enable (clk-gpios, P0.30)
++	 * high from GPIO driver init onward, so the LF clock source is already
++	 * running when the firmware later switches LFCLK to it. Runtime code
++	 * (set_sensor_clock) still toggles this pin for sleep. */
++	sensor_clk_en: sensor_clk_en {
++		gpio-hog;
++		gpios = <30 GPIO_ACTIVE_HIGH>;
++		output-high;
++	};
+ };
+ 
+ &gpio1 {
+diff --git a/boards/spiroooo/miro/miro_uf2_defconfig b/boards/spiroooo/miro/miro_uf2_defconfig
+index aa400ac..70d0ea5 100644
+--- a/boards/spiroooo/miro/miro_uf2_defconfig
++++ b/boards/spiroooo/miro/miro_uf2_defconfig
+@@ -17,3 +17,12 @@ CONFIG_BUILD_OUTPUT_UF2=y
+ CONFIG_FLASH_LOAD_OFFSET=0x1000
+ 
+ CONFIG_CLOCK_USE_LFXO=y
++# XL1 is fed by an active oscillator (gated by P0.30), not a crystal
++CONFIG_CLOCK_LFXO_FULL_SWING=y
++
++# nRF52833 UF2 family ID so the Adafruit bootloader accepts drag-and-drop images
++CONFIG_BUILD_OUTPUT_UF2_FAMILY_ID="0x621E937A"
++
++# P0.09 (green LED) is an NFC pin; release it as GPIO. Note: the first boot
++# after a full chip erase writes UICR and performs one extra reset.
++CONFIG_NFCT_PINS_AS_GPIOS=y
+diff --git a/src/system/clock_control.c b/src/system/clock_control.c
+index bd9bfad..00b77eb 100644
+--- a/src/system/clock_control.c
++++ b/src/system/clock_control.c
+@@ -18,6 +18,7 @@
+ 	THE SOFTWARE.
+ */
+ #include "clock_control.h"
++#include "globals.h"
+ 
+ #include <zephyr/kernel.h>
+ #include <zephyr/irq.h>
+@@ -28,14 +29,43 @@
+ // clock_control already has a log module defined in nrf_clock_control, so we define our own for this file
+ LOG_MODULE_REGISTER(clock_switch, LOG_LEVEL_INF);
+ 
+-#define LFCLK_WAIT_STEP_US 300
++/*
++ * IMPORTANT: while the LF clock is being switched it may be stopped or dead.
++ * The kernel tick (RTC) and the hardware watchdog are both clocked by LFCLK,
++ * so neither k_usleep()/k_msleep() nor k_busy_wait() may be used in the
++ * switching path: on nRF5 all of them are backed by the RTC, and if the new
++ * source produces no edges they never return, freezing the entire timebase -
++ * watchdog included. All waiting below uses a CPU-cycle delay loop instead,
++ * and every wait is bounded, so a missing or gated oscillator degrades to
++ * the internal RC oscillator instead of hanging the system.
++ */
++
++#define LFCLK_POLL_STEP_US 50
++#define LFCLK_STOP_TIMEOUT_US 100000 /* 100 ms */
++#define LFCLK_RC_START_TIMEOUT_US 100000 /* 100 ms; RC typically starts in <1 ms */
++/* Crystal LFXO startup is typically ~250 ms and can approach 1 s */
++#define LFCLK_EXT_START_TIMEOUT_US 1000000 /* 1 s */
++/* Must span several 32.768 kHz periods (30.5 us each) */
++#define LFCLK_EDGE_CHECK_US 300
++
++/* CPU-cycle based delay, independent of the LF clock. Calibrated
++ * conservatively for a 64 MHz Cortex-M4: the volatile counter loop takes
++ * 3-6 cycles per iteration, so 22 iterations/us guarantees at least the
++ * requested delay (and at most ~2x, which only lengthens timeouts). */
++static void lfclk_cpu_delay_us(uint32_t us)
++{
++	for (volatile uint32_t i = us * 22U; i != 0U; i--) {
++	}
++}
+ 
+ /* Helper to normalize XTAL variants for comparison */
+ static inline nrf_clock_lfclk_t normalize_source(nrf_clock_lfclk_t source)
+ {
+ 	/* XTAL_FULL_SWING and XTAL_LOW_SWING report as XTAL in actual source */
+-	if (
+-		source == NRF_CLOCK_LFCLK_XTAL_FULL_SWING
++	if (false
++#ifdef NRF_CLOCK_LFCLK_XTAL_FULL_SWING
++		|| source == NRF_CLOCK_LFCLK_XTAL_FULL_SWING
++#endif
+ #ifdef NRF_CLOCK_LFCLK_XTAL_LOW_SWING
+ 		|| source == NRF_CLOCK_LFCLK_XTAL_LOW_SWING
+ #endif
+@@ -57,8 +87,67 @@ static bool lfclk_running_source_get(nrf_clock_lfclk_t *source)
+ 	return running;
+ }
+ 
+-// Safely switch LF clock source
+-void clock_switch(nrf_clock_lfclk_t source)
++static bool lfclk_wait_started(uint32_t timeout_us)
++{
++	uint32_t waited_us = 0;
++	while (!nrf_clock_event_check(NRF_CLOCK, NRF_CLOCK_EVENT_LFCLKSTARTED)) {
++		if (waited_us >= timeout_us) {
++			return false;
++		}
++		lfclk_cpu_delay_us(LFCLK_POLL_STEP_US);
++		waited_us += LFCLK_POLL_STEP_US;
++	}
++	return true;
++}
++
++static void lfclk_stop_bounded(void)
++{
++	if (!lfclk_running_source_get(NULL)) {
++		return;
++	}
++	nrf_clock_task_trigger(NRF_CLOCK, NRF_CLOCK_TASK_LFCLKSTOP);
++	uint32_t waited_us = 0;
++	while (lfclk_running_source_get(NULL)) {
++		if (waited_us >= LFCLK_STOP_TIMEOUT_US) {
++			LOG_ERR("clock_switch: LFCLK did not stop");
++			return;
++		}
++		lfclk_cpu_delay_us(LFCLK_POLL_STEP_US);
++		waited_us += LFCLK_POLL_STEP_US;
++	}
++}
++
++/* The kernel cycle counter is driven by the RTC, which counts LFCLK edges.
++ * LFCLKSTARTED alone is not proof of a usable clock: in external full-swing
++ * (bypass) mode it can fire while the driving oscillator is still gated off,
++ * leaving a "running" LF clock that never ticks. Verify real edges. */
++static bool lfclk_producing_edges(void)
++{
++	uint32_t start = k_cycle_get_32();
++	lfclk_cpu_delay_us(LFCLK_EDGE_CHECK_US);
++	return k_cycle_get_32() != start;
++}
++
++static bool lfclk_start_source(nrf_clock_lfclk_t source, uint32_t timeout_us)
++{
++	nrf_clock_event_clear(NRF_CLOCK, NRF_CLOCK_EVENT_LFCLKSTARTED);
++	nrf_clock_lf_src_set(NRF_CLOCK, source);
++	nrf_clock_task_trigger(NRF_CLOCK, NRF_CLOCK_TASK_LFCLKSTART);
++	if (!lfclk_wait_started(timeout_us)) {
++		LOG_ERR("clock_switch: source=%d did not start within %u us", source, timeout_us);
++		return false;
++	}
++	if (!lfclk_producing_edges()) {
++		LOG_ERR("clock_switch: source=%d started but produces no edges", source);
++		return false;
++	}
++	return true;
++}
++
++// Safely switch LF clock source.
++// Returns true when the requested source ends up running; on failure the
++// clock is restored to the internal RC oscillator and false is returned.
++bool clock_switch(nrf_clock_lfclk_t source)
+ {
+ 	LOG_INF("clock_switch: requesting source=%d", source);
+ 
+@@ -67,10 +156,16 @@ void clock_switch(nrf_clock_lfclk_t source)
+ 	 * Avoid switching to XTAL when the board does not have an external LFXO.
+ 	 * Note: switching to RC is always safe.
+ 	 */
+-	if (!IS_ENABLED(CONFIG_CLOCK_USE_LFXO)
+-		&& (source == NRF_CLOCK_LFCLK_XTAL || source == NRF_CLOCK_LFCLK_XTAL_FULL_SWING)) {
++	bool xtal_source = source == NRF_CLOCK_LFCLK_XTAL;
++#ifdef NRF_CLOCK_LFCLK_XTAL_FULL_SWING
++	xtal_source = xtal_source || source == NRF_CLOCK_LFCLK_XTAL_FULL_SWING;
++#endif
++#ifdef NRF_CLOCK_LFCLK_XTAL_LOW_SWING
++	xtal_source = xtal_source || source == NRF_CLOCK_LFCLK_XTAL_LOW_SWING;
++#endif
++	if (!IS_ENABLED(CONFIG_CLOCK_USE_LFXO) && xtal_source) {
+ 		LOG_INF("clock_switch: skipping XTAL, CONFIG_CLOCK_USE_LFXO disabled");
+-		return;
++		return false;
+ 	}
+ #endif
+ 
+@@ -81,39 +176,28 @@ void clock_switch(nrf_clock_lfclk_t source)
+ 
+ 	if (running && current_source == normalized_requested) {
+ 		LOG_INF("clock_switch: already running with source=%d", current_source);
+-		return;
++		return true;
+ 	}
+ 
+ 	LOG_INF("clock_switch: %d -> %d", current_source, normalized_requested);
+ 
+-	if (running) {
+-		nrf_clock_task_trigger(NRF_CLOCK, NRF_CLOCK_TASK_LFCLKSTOP);
+-
+-		do {
+-			running = lfclk_running_source_get(&current_source);
+-		} while (running && current_source != NRF_CLOCK_LFCLK_RC);
+-	}
+-
+-	/*
+-	 * Start and wait for LFCLKSTARTED event, as used in sdk-nrf board init hooks.
+-	 * This avoids returning early before the LF clock has actually started.
+-	 */
+-	nrf_clock_event_clear(NRF_CLOCK, NRF_CLOCK_EVENT_LFCLKSTARTED);
+-	nrf_clock_lf_src_set(NRF_CLOCK, source);
+-	nrf_clock_task_trigger(NRF_CLOCK, NRF_CLOCK_TASK_LFCLKSTART);
++	lfclk_stop_bounded();
+ 
+-	if (source == NRF_CLOCK_LFCLK_RC) {
+-		// RC starts very quickly, just wait for the event without sleeping
+-		while (!nrf_clock_event_check(NRF_CLOCK, NRF_CLOCK_EVENT_LFCLKSTARTED)) {}
+-	} else {
+-		uint32_t waited_us = 0;
+-		while (!nrf_clock_event_check(NRF_CLOCK, NRF_CLOCK_EVENT_LFCLKSTARTED)) {
+-			k_usleep(LFCLK_WAIT_STEP_US);
+-			waited_us += LFCLK_WAIT_STEP_US;
++	uint32_t timeout_us = source == NRF_CLOCK_LFCLK_RC ? LFCLK_RC_START_TIMEOUT_US
++							   : LFCLK_EXT_START_TIMEOUT_US;
++	if (!lfclk_start_source(source, timeout_us)) {
++		if (source == NRF_CLOCK_LFCLK_RC) {
++			/* RC itself failed to start: nothing left to fall back to */
++			return false;
+ 		}
+-		if (waited_us > 1000) {
+-			LOG_INF("clock_switch: LFCLK start waited %u us", waited_us);
++		/* Fall back to the internal RC oscillator so the kernel tick and
++		 * the watchdog keep running instead of freezing the system. */
++		LOG_ERR("clock_switch: falling back to RC oscillator");
++		lfclk_stop_bounded();
++		if (!lfclk_start_source(NRF_CLOCK_LFCLK_RC, LFCLK_RC_START_TIMEOUT_US)) {
++			LOG_ERR("clock_switch: RC fallback failed");
+ 		}
++		return false;
+ 	}
+ 
+ 	/* Verify the actual clock source matches what we requested */
+@@ -121,9 +205,10 @@ void clock_switch(nrf_clock_lfclk_t source)
+ 	bool actual_running = lfclk_running_source_get(&actual_source);
+ 	if (!actual_running || actual_source != normalized_requested) {
+ 		LOG_ERR("clock_switch: source mismatch! requested=%d, actual=%d", normalized_requested, actual_source);
+-	} else {
+-		LOG_INF("clock_switch: switched to source=%d successfully", actual_source);
++		return false;
+ 	}
++	LOG_INF("clock_switch: switched to source=%d successfully", actual_source);
++	return true;
+ }
+ 
+ // Switch to RC clock before shut down to avoid any problems with the bootloader
+@@ -142,7 +227,30 @@ void clock_init_external(void)
+ {
+ #if defined(NRF_CLOCK_USE_EXTERNAL_LFCLK_SOURCES) || defined(__NRFX_DOXYGEN__)
+ 	if (IS_ENABLED(CONFIG_CLOCK_USE_LFXO)) {
+-		clock_switch(NRF_CLOCK_LFCLK_XTAL_FULL_SWING);
++		nrf_clock_lfclk_t source = NRF_CLOCK_LFCLK_XTAL;
++#ifdef NRF_CLOCK_LFCLK_XTAL_FULL_SWING
++		if (IS_ENABLED(CONFIG_CLOCK_LFXO_FULL_SWING)) {
++			/* XL1 is driven by an active oscillator (rail-to-rail square
++			 * wave), not a crystal: use external full-swing (bypass) mode */
++			source = NRF_CLOCK_LFCLK_XTAL_FULL_SWING;
++		}
++#endif
++		/* The oscillator may still be powering up (MEMS parts need ~150 ms,
++		 * and on some boards it is gated by a GPIO asserted during init),
++		 * so retry before giving up. Between attempts the LF clock runs on
++		 * RC (clock_switch falls back on failure), so sleeping is safe. */
++		for (int attempt = 0; attempt < 4; attempt++) {
++			if (attempt > 0) {
++				if (!lfclk_running_source_get(NULL)) {
++					break; /* no timebase to sleep on; should not happen */
++				}
++				k_msleep(500);
++			}
++			if (clock_switch(source)) {
++				return;
++			}
++		}
++		LOG_ERR("clock_init_external: LFXO unavailable, staying on RC oscillator");
+ 	} else if (IS_ENABLED(CONFIG_CLOCK_USE_LF_SYNTH)) {
+ 		/* Use LF synthesizer (derived from HFXO) for TDMA timing precision
+ 		 * when LFXO is not available on the board */
+@@ -159,6 +267,10 @@ void clock_init_external(void)
+ static struct k_thread clock_init_thread_id;
+ static K_THREAD_STACK_DEFINE(clock_init_thread_stack, 512);
+ 
++#ifndef CLOCK_INIT_THREAD_PRIORITY
++#define CLOCK_INIT_THREAD_PRIORITY 8
++#endif
++
+ static void clock_init_external_async_thread(void *arg1, void *arg2, void *arg3)
+ {
+ 	ARG_UNUSED(arg1);
+@@ -177,7 +289,7 @@ void clock_init_external_async(void)
+ 		NULL,
+ 		NULL,
+ 		NULL,
+-		8,
++		CLOCK_INIT_THREAD_PRIORITY,
+ 		0,
+ 		K_NO_WAIT
+ 	);
+diff --git a/src/system/dfu_diag.c b/src/system/dfu_diag.c
+new file mode 100644
+index 0000000..6aaace3
+--- /dev/null
++++ b/src/system/dfu_diag.c
+@@ -0,0 +1,72 @@
++/*
++ * Copyright (c) 2026 SlimeVR Contributors
++ *
++ * SPDX-License-Identifier: MIT
++ */
++
++#include "dfu_diag.h"
++#include "system/system.h"
++
++#include <zephyr/kernel.h>
++#include <zephyr/init.h>
++#include <zephyr/logging/log.h>
++
++LOG_MODULE_REGISTER(dfu_diag, LOG_LEVEL_INF);
++
++#define DFU_DIAG_MAGIC 0x44465544 /* "DFUD" */
++
++struct dfu_diag_record_s {
++	uint32_t magic;
++	uint32_t uptime_ms; /* uptime at the moment DFU entry was requested */
++	uint8_t reason;     /* DFU_DIAG_REASON_* */
++	uint8_t detail;
++	uint16_t count;     /* total programmatic DFU entries over device life */
++};
++
++static struct dfu_diag_record_s last_record;
++
++static const char *dfu_diag_reason_str(uint8_t reason)
++{
++	switch (reason) {
++	case DFU_DIAG_REASON_WATCHDOG:
++		return "watchdog reset threshold";
++	case DFU_DIAG_REASON_REQUEST:
++		return "user/remote request";
++	default:
++		return "unknown";
++	}
++}
++
++void dfu_diag_record(uint8_t reason, uint8_t detail)
++{
++	struct dfu_diag_record_s record = {
++		.magic = DFU_DIAG_MAGIC,
++		.uptime_ms = k_uptime_get_32(),
++		.reason = reason,
++		.detail = detail,
++		.count = (uint16_t)(last_record.count + 1),
++	};
++	LOG_WRN("Recording DFU entry: %s (detail %u) at uptime %u ms",
++		dfu_diag_reason_str(reason), detail, record.uptime_ms);
++	/* No retained mirror; NVS only, so the record survives POR and DFU */
++	sys_write(DFU_DIAG_NVS_ID, NULL, &record, sizeof(record));
++	last_record = record;
++}
++
++/* Report the previous programmatic DFU entry once per boot. sys_read zeroes
++ * the buffer when no entry exists, which fails the magic check silently. */
++static int dfu_diag_report(void)
++{
++	sys_read(DFU_DIAG_NVS_ID, &last_record, sizeof(last_record));
++	if (last_record.magic != DFU_DIAG_MAGIC) {
++		last_record = (struct dfu_diag_record_s){0};
++		return 0;
++	}
++	LOG_WRN("Last programmatic DFU entry: %s (detail %u) at uptime %u ms, %u total",
++		dfu_diag_reason_str(last_record.reason), last_record.detail,
++		last_record.uptime_ms, last_record.count);
++	return 0;
++}
++
++/* After sys_retained_init (CONFIG_APPLICATION_INIT_PRIORITY) so NVS is up */
++SYS_INIT(dfu_diag_report, APPLICATION, 99);
+diff --git a/src/system/dfu_diag.h b/src/system/dfu_diag.h
+new file mode 100644
+index 0000000..3bc53f7
+--- /dev/null
++++ b/src/system/dfu_diag.h
+@@ -0,0 +1,41 @@
++/*
++ * Copyright (c) 2026 SlimeVR Contributors
++ *
++ * SPDX-License-Identifier: MIT
++ *
++ * Persistent record of programmatic DFU/bootloader entries.
++ *
++ * Whenever the firmware itself decides to reboot into the bootloader
++ * (watchdog recovery, console/remote command, button action), a small
++ * record is written to NVS first. Because NVS lives in flash it survives
++ * power-on resets and the DFU round trip, so an unexpected visit to the
++ * bootloader can be diagnosed after the fact: the reason is logged at the
++ * next boot.
++ *
++ * If the device is found sitting in DFU and the next boot does NOT report
++ * a recent record, the entry was made by the bootloader on its own
++ * (button pin, double reset, invalid app) rather than by the firmware.
++ */
++
++#pragma once
++
++#include <stdint.h>
++
++/* NVS ID for the diagnostic record; keep clear of IDs in system.h (1-8, 29-39) */
++#define DFU_DIAG_NVS_ID 45
++
++#define DFU_DIAG_REASON_NONE 0
++#define DFU_DIAG_REASON_WATCHDOG 1 /* repeated WDT resets reached threshold */
++#define DFU_DIAG_REASON_REQUEST 2  /* console command, button action, or remote command */
++
++/**
++ * @brief Persist the reason for an imminent programmatic DFU entry.
++ *
++ * Call immediately before setting the bootloader magic / rebooting.
++ * Safe to call from any thread context; writes through the NVS layer.
++ *
++ * @param reason DFU_DIAG_REASON_*
++ * @param detail reason-specific detail (watchdog: failing WDT channel;
++ *               request: 1 for OTA, 0 for UF2/serial)
++ */
++void dfu_diag_record(uint8_t reason, uint8_t detail);
+diff --git a/src/system/system.c b/src/system/system.c
+index 43aeaf5..9f31eed 100644
+--- a/src/system/system.c
++++ b/src/system/system.c
+@@ -16,6 +16,7 @@
+ #include <hal/nrf_gpio.h>
+ 
+ #include "system.h"
++#include "dfu_diag.h"
+ #include "battery_tracker.h"
+ #include "build_defines.h"
+ 
+@@ -627,6 +628,8 @@ void sys_reset_mode(uint8_t mode)
+ 	case 6: // Reset mode DFU
+ #endif
+ 		LOG_INF("DFU requested");
++		/* Persist why we are entering DFU so the next boot can report it */
++		dfu_diag_record(DFU_DIAG_REASON_REQUEST, 0);
+ #if ADAFRUIT_BOOTLOADER
+ 		NRF_POWER->GPREGRET = ADAFRUIT_DFU_MAGIC_UF2_RESET;
+ 		sys_request_system_reboot(false);
+@@ -638,6 +641,8 @@ void sys_reset_mode(uint8_t mode)
+ 	case 7:
+ 	case 8: // Reset mode DFU OTA
+ 		LOG_INF("DFU OTA requested");
++		/* Persist why we are entering DFU so the next boot can report it */
++		dfu_diag_record(DFU_DIAG_REASON_REQUEST, 1);
+ #if ADAFRUIT_BOOTLOADER
+ 		NRF_POWER->GPREGRET = ADAFRUIT_DFU_MAGIC_OTA_RESET;
+ 		sys_request_system_reboot(false);
+diff --git a/src/system/watchdog.c b/src/system/watchdog.c
+index 0c40486..025b3eb 100644
+--- a/src/system/watchdog.c
++++ b/src/system/watchdog.c
+@@ -11,6 +11,7 @@
+ 
+ #include "watchdog.h"
+ #include "globals.h"
++#include "system/dfu_diag.h"
+ #include <zephyr/task_wdt/task_wdt.h>
+ #include <zephyr/drivers/watchdog.h>
+ #include <zephyr/device.h>
+@@ -141,6 +142,10 @@ static void enter_dfu_mode(void)
+ 	LOG_WRN("WDT reset count reached threshold (%d), entering DFU mode",
+ 		WATCHDOG_RESET_THRESHOLD);
+ 
++	/* Persist why we are entering DFU so the next boot can report it */
++	dfu_diag_record(DFU_DIAG_REASON_WATCHDOG,
++			retained ? retained->watchdog_state.last_failed_channel : 0xFF);
++
+ 	/* Clear reset counter BEFORE entering DFU to prevent looping back into DFU
+ 	 * when bootloader times out and returns to firmware.
+ 	 */

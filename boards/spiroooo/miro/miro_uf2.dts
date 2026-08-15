@@ -188,3 +188,10 @@ zephyr_udc0: &usbd {
 		reg = <0>;
 	};
 };
+
+
+/* P0.09 (green LED) is an NFC pin; release it as GPIO. The first boot after
+ * a full chip erase writes UICR and performs one extra reset. */
+&uicr {
+	nfct-pins-as-gpios;
+};
