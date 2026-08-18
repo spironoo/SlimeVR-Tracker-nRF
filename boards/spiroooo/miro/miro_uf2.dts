@@ -189,9 +189,9 @@ zephyr_udc0: &usbd {
 	};
 };
 
-/* P0.09 (green LED) is an NFC pin; release it as GPIO. Disabling &nfct alone
- * does not do this - it needs the UICR bit. The first boot after a full chip
- * erase writes UICR and performs one extra reset. */
+
+/* P0.09 (green LED) is an NFC pin; release it as GPIO. The first boot after
+ * a full chip erase writes UICR and performs one extra reset. */
 &uicr {
 	nfct-pins-as-gpios;
 };

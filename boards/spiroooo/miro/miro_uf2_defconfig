@@ -17,9 +17,6 @@ CONFIG_BUILD_OUTPUT_UF2=y
 CONFIG_FLASH_LOAD_OFFSET=0x1000
 
 CONFIG_CLOCK_USE_LFXO=y
-# XL1 is fed by an active oscillator (gated by P0.30), not a crystal.
-# Upstream renamed this knob: it is now a choice, and its default is XTAL.
+# XL1 is driven by an active 32.768 kHz oscillator (gated by P0.30), not a
+# crystal across XL1/XL2, so the LF clock must run in external full-swing mode.
 CONFIG_CLOCK_USE_LFXO_MODE_FULL_SWING=y
-
-# nRF52833 UF2 family ID so the Adafruit bootloader accepts drag-and-drop images
-CONFIG_BUILD_OUTPUT_UF2_FAMILY_ID="0x621E937A"
