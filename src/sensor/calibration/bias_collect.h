@@ -54,6 +54,9 @@
 #define BIAS_COLLECT_ACCEL_MOTION_THRESHOLD 0.06f // G (range method)
 #endif
 
+/* Distinct from timeout (-2): acquisition completed without enough samples. */
+#define BIAS_COLLECT_INSUFFICIENT_SAMPLES (-4)
+
 int sensor_offsetBias_internal(
 	float *dest1,
 	float *dest2,
@@ -64,8 +67,8 @@ int sensor_offsetBias_internal(
 );
 int sensor_offsetBias(float *dest1, float *dest2, float *avg_temp, float *temp_range);
 
-#if CONFIG_SENSOR_USE_6_SIDE_CALIBRATION
-/* Rest detector used by 6-side capture in calibration.c */
+#if CONFIG_SENSOR_USE_ACCEL_CALIBRATION
+/* Rest detector used by accelerometer pose capture in cal_mag.c. */
 int isAccRest(float *acc, float *pre_acc, float threshold, int *t, int restdelta);
 #endif
 

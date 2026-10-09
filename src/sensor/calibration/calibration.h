@@ -25,10 +25,39 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include "system/led.h"
+
+/* Local feedback is independent of optional tracker-event tokens. Capture once
+ * at admission and carry it through collection, frame application and storage. */
+static inline void sensor_calibration_stage(struct led_token token, enum led_semantic semantic)
+{
+	if (token.session) {
+		led_state(token, led_event_id(), semantic);
+	}
+}
+
+static inline void sensor_calibration_result(struct led_token token, enum led_semantic semantic)
+{
+	if (token.session) {
+		led_result(token, led_event_id(), semantic);
+	}
+}
+
+/* Synchronous mutations do not replace an unrelated active calibration. */
+static inline int sensor_operation_result(enum led_owner owner, int result, bool applied)
+{
+	led_request_event(owner, led_request_id(), led_event_id(),
+		result < 0 ? (applied ? LED_APPLIED_NOT_SAVED : LED_REJECTED) : LED_SUCCESS);
+	return result;
+}
 
 /* Sensor feeds data to calibration */
 void sensor_calibration_process_accel(float a[3]);
-void sensor_calibration_process_gyro(float g[3]);
+/* Sensor owner: delta is old minus new firmware offset (unscaled dps).
+ * Return true for a new measured calibration, which resets residual bias. */
+bool sensor_calibration_process_gyro(float g[3], float reference_delta[3]);
+void sensor_calibration_reset_gyro_reference(void);
+bool sensor_calibration_gyro_reference_pending(void);
 void sensor_calibration_process_mag(float m[3]);
 
 void sensor_calibration_update_sensor_ids(int imu);
@@ -37,29 +66,93 @@ uint8_t *sensor_calibration_get_sensor_data();
 
 void sensor_calibration_read(void);
 
-int sensor_calibration_validate(float *a_bias, float *g_bias, bool write);
-#if CONFIG_SENSOR_USE_6_SIDE_CALIBRATION
-int sensor_calibration_validate_6_side(float a_inv[][3], bool write);
-#endif
+typedef struct {
+	float accel_bias[3];
+	float gyro_bias[3];
+	float accel_matrix[4][3];
+} sensor_imu_calibration_t;
+
+/* Coherent applied coefficients, never a writable view of owner storage. */
+void sensor_calibration_snapshot(sensor_imu_calibration_t *out);
+/* Nonblocking submission: -EAGAIN without a ready consumer, -EBUSY for an
+ * occupied transaction/reset-all barrier, -ESHUTDOWN once terminally closed.
+ * Accepted candidates survive suspend/failed rescan for recovery or power drain;
+ * reset-all cancels them. Application remains at a sensor frame boundary. */
+int sensor_calibration_commit_bias(const float a_bias[3], const float g_bias[3], bool persist_gyro,
+	uint16_t operation_id, struct led_token feedback, int prior_error, uint32_t generation);
+int sensor_calibration_commit_accel(const float matrix[4][3], uint16_t operation_id,
+	struct led_token feedback, bool partial, uint32_t generation);
+void sensor_calibration_record_storage_error(uint32_t generation, int error);
+int sensor_calibration_reset_imu(void);
+int sensor_calibration_reset_accel(void);
+/* Power owner calls only after the sensor is quiescent. No live fusion mutation. */
+void sensor_calibration_prepare_power_down(void);
+/* System reset-all barrier: call before storage lock, end after releasing it.
+ * Waits for in-flight persistence and cancels all pre-clear IMU transactions. */
+void sensor_calibration_clear_begin(void);
+void sensor_calibration_clear_end(void);
+/* Reset-all caller holds the storage lock; current live coefficients survive. */
+void sensor_calibration_online_mag_cancel_pending(void);
+
+int sensor_calibration_set_sensitivity(const float degrees[3]);
+int sensor_calibration_reset_sensitivity(void);
 int sensor_calibration_validate_mag(float m_inv[][3], bool write);
 
-void sensor_calibration_clear(float *a_bias, float *g_bias, bool write);
-#if CONFIG_SENSOR_USE_6_SIDE_CALIBRATION
-void sensor_calibration_clear_6_side(float a_inv[][3], bool write);
-#endif
-void sensor_calibration_clear_mag(float m_inv[][3], bool write); // "request" mag cal
+/* Candidate initialization only; live coefficients change through commits. */
+void sensor_calibration_identity_accel(float matrix[4][3]);
+int sensor_calibration_clear_mag(float m_inv[][3], bool write, bool user_feedback);
 
-void sensor_request_calibration(void);
-void sensor_request_calibration_6_side(void);
-void sensor_request_calibration_mag(void);
+enum sensor_calibration_request_id {
+	CAL_REQUEST_CLEAR = -1,
+	CAL_REQUEST_QUERY = 0,
+	CAL_REQUEST_IMU = 1,
+	CAL_REQUEST_ACCEL_POSES = 2,
+	CAL_REQUEST_TCAL_BOOT = 3,
+	CAL_REQUEST_TCAL_RUNTIME = 4,
+	CAL_REQUEST_GYRO_SENS = 5,
+	/* Occupies the shared request slot throughout manual mag collection. */
+	CAL_REQUEST_MAG = 6,
+#if CONFIG_SENSOR_TCAL_HEATED
+	CAL_REQUEST_TCAL_HEATED = 7,
+#endif
+	CAL_REQUEST_MAINTENANCE = 8,
+};
+
+enum cal_request_origin {
+	CAL_REQUEST_USER = 0,
+	CAL_REQUEST_AUTO = 1,
+	CAL_REQUEST_AUTO_SILENT = 2,
+};
+
+/* QUERY returns the pending request ID, or 0 when idle. CLEAR ends sample
+ * admission and clears the slot, not a candidate already handed to its owner. */
+int sensor_calibration_request(int id, enum cal_request_origin origin);
+/* Reserve the request slot without starting a collector, in every build. */
+int sensor_calibration_maintenance_begin(void);
+void sensor_calibration_maintenance_end(void);
+uint16_t sensor_calibration_current_operation(void);
+struct led_token sensor_calibration_current_feedback(void);
+int sensor_calibration_current_storage_error(void);
+/* Collection epochs are independent of LED/wire tokens. Zero denotes a direct
+ * non-collector transaction; reset-all invalidates every accepted old collector. */
+uint32_t sensor_calibration_current_generation(void);
+bool sensor_calibration_generation_valid(uint32_t generation);
+void sensor_calibration_invalidate_requests(void);
+void sensor_calibration_invalidate_kind(int kind);
+
+int sensor_request_calibration(void);
+int sensor_request_calibration_accel(void);
+int sensor_request_calibration_mag(void);
 #if CONFIG_SENSOR_USE_SENS_CALIBRATION
 int sensor_request_calibration_sens(uint8_t axis, uint16_t revolutions);
 #endif
-void sensor_calibration_online_mag_sample(const float m[3]);
+/* Always service ownership, even when disabled. Gravity is reliable independent
+ * 6D up expressed in the raw magnetometer axis basis, never magnetic heading. */
+void sensor_calibration_online_mag_sample(const float raw[3], const float gravity_raw[3], bool gravity_valid);
 int sensor_calibration_online_mag_status(float *dir_bias);
 void sensor_calibration_track_mag_norm(float cal_norm);
 float sensor_calibration_get_mag_quality(void);
-void sensor_calibration_set_online_mag_enabled(bool enabled);
+int sensor_calibration_set_online_mag_enabled(bool enabled);
 bool sensor_calibration_get_online_mag_enabled(void);
 void sensor_calibration_online_mag_retained_save(void);
 void sensor_calibration_online_mag_retained_clear(void);
@@ -81,16 +174,16 @@ typedef struct {
 void sensor_calibration_get_last_gyro_offset(float offset[3]);
 
 // T-Cal maintenance/status
-void sensor_tcal_clear(void);
+int sensor_tcal_clear(void);
 void sensor_tcal_status(void);
-void sensor_tcal_remove_point(int index_to_remove);
-bool sensor_tcal_is_temp_outside_range(float temp, float *min_temp, float *max_temp);
+int sensor_tcal_remove_point(int index_to_remove);
+bool sensor_tcal_needs_nearby_point(float temp, float *closest_temp, float *distance_c);
 void sensor_tcal_check_auto_calibration(float current_temp);
-void sensor_tcal_set_auto_calibration(bool enabled);
+int sensor_tcal_set_auto_calibration(bool enabled);
 bool sensor_tcal_get_auto_calibration(void);
 
 // T-Cal compensation enable/disable (persisted)
-void sensor_tcal_set_enabled(bool enabled);
+int sensor_tcal_set_enabled(bool enabled);
 bool sensor_tcal_get_enabled(void);
 
 /* What process_gyro actually subtracts right now (flag vs curve readiness). */
@@ -101,6 +194,10 @@ typedef enum {
 } sensor_tcal_apply_mode_t;
 
 sensor_tcal_apply_mode_t sensor_tcal_get_apply_mode(void);
+/* Copies mode and up to TCAL_BUFFER_SIZE compact points under one mutex. */
+struct TempCalPoint;
+sensor_tcal_apply_mode_t sensor_tcal_snapshot(bool *enabled, struct TempCalPoint *points,
+					    uint16_t *count);
 const char *sensor_tcal_get_apply_mode_name(void);
 /* Hot-path: cached (enabled && points>=min). Updated on enable/point changes. */
 bool sensor_tcal_curve_apply_ready(void);
@@ -115,7 +212,7 @@ bool sensor_tcal_assess_quality(float current_temp, tcal_quality_t *quality);
 
 // Boot calibration functions
 void sensor_tcal_boot_calibration_check(void);
-void sensor_boot_cal_set_enabled(bool enabled);
+int sensor_boot_cal_set_enabled(bool enabled);
 bool sensor_boot_cal_is_completed(void);
 void sensor_boot_cal_get_doffset(float offset[3]);
 void sensor_boot_cal_reset(void); // Reset boot calibration state (call before reboot/shutdown, not before WoM)
@@ -126,6 +223,9 @@ void sensor_runtime_cal_get_status(int64_t *last_cal_time, int64_t *rest_duratio
 
 // Test function for comparing calibration methods
 void sensor_tcal_test_methods(float temp);
+/* Storage owner reports the completed warm transaction after releasing storage.
+ * Never consumes a newer request's token or treats a RAM dirty mark as saved. */
+void sensor_tcal_feedback_persisted(uint32_t identity, uint8_t written_mask, int result);
 #endif
 
 #endif

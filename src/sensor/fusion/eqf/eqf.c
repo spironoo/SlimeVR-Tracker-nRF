@@ -128,6 +128,7 @@ static float mag_candidate_dip;    /* alternative field candidate dip    */
 static float mag_candidate_t;      /* time spent in candidate field      */
 static float mag_undisturbed_t;    /* stable time in current field       */
 static float mag_reject_t;         /* accumulated rejection time         */
+static bool mag_rebase_pending;
 
 /* ── 3×3 matrix helpers (row-major float[9]) ───────────────────────── */
 
@@ -247,7 +248,7 @@ static inline float eqf_get_mag_ref_dip(void)
 	return atan2f(-st.d_mag[2], st.d_mag[0]);
 }
 
-void eqf_set_mag_ref(float norm, float dip)
+static void eqf_set_mag_ref(float norm, float dip)
 {
 	float c = cosf(dip);
 	float s = sinf(dip);
@@ -1043,8 +1044,11 @@ static void eqf_rest_bias_update(void)
 
 /* ── Public API ────────────────────────────────────────────────────── */
 
+static bool rest_observation_pending;
+
 void eqf_init(float g_time, float a_time, float m_time)
 {
+	rest_observation_pending = false;
 	dt_gyr = g_time;
 	dt_acc = a_time;
 	dt_mag = m_time;
@@ -1084,11 +1088,13 @@ void eqf_init(float g_time, float a_time, float m_time)
 
 	/* reset magnetic state */
 	mag_ref_valid = false;
+	mag_rebase_pending = false;
 	eqf_reset_mag_runtime_state(false);
 }
 
 void eqf_load(const void *data)
 {
+	rest_observation_pending = false;
 	BUILD_ASSERT(sizeof(eqf_saved_t) <= sizeof(((struct retained_data *)0)->fusion_data),
 		     "EqF state exceeds fusion_data buffer");
 
@@ -1255,6 +1261,7 @@ void eqf_update_accel(float *a, float time)
 	/* apply bias measurement update during rest */
 	if (rest_detected && rest_gyr_lp_init)
 		eqf_rest_bias_update();
+	rest_observation_pending = true;
 }
 
 void eqf_update_mag(float *m, float time)
@@ -1263,6 +1270,36 @@ void eqf_update_mag(float *m, float time)
 	float mn = v3_norm(m);
 	if (mn < 1e-10f)
 		return;
+
+	/* A calibration handoff cannot reuse the old field's trust or apply a
+	 * first-sample heading correction. Reacquire without touching A/a_vec/P. */
+	if (mag_rebase_pending) {
+		float current_norm, current_dip;
+		eqf_get_mag_norm_dip(m, &current_norm, &current_dip);
+		float reference_norm = mag_ref_valid ? st.mag_ref_norm : mag_candidate_norm;
+		float reference_dip = mag_ref_valid ? eqf_get_mag_ref_dip() : mag_candidate_dip;
+		if (reference_norm > 0.0f && fabsf(current_norm - reference_norm) < EQF_MAG_NORM_TH * reference_norm
+			&& fabsf(current_dip - reference_dip) < EQF_MAG_DIP_TH * DEG_TO_RAD) {
+			if (mag_ref_valid || v3_norm(rest_gyr_lp) >= EQF_MAG_NEW_MIN_GYR * DEG_TO_RAD) {
+				mag_candidate_t += dt;
+			}
+		} else {
+			mag_candidate_norm = current_norm;
+			mag_candidate_dip = current_dip;
+			mag_candidate_t = 0.0f;
+		}
+		float required = mag_ref_valid ? EQF_MAG_MIN_UNDISTURBED_T : EQF_MAG_NEW_FIRST_TIME;
+		if (mag_candidate_t < required) {
+			return;
+		}
+		if (!mag_ref_valid) {
+			eqf_set_mag_ref(mag_candidate_norm, mag_candidate_dip);
+			mag_ref_valid = true;
+		}
+		mag_rebase_pending = false;
+		eqf_reset_mag_runtime_state(true);
+		return;
+	}
 
 	if (mode == EQF_INIT) {
 		mag_sum[0] += m[0]; mag_sum[1] += m[1]; mag_sum[2] += m[2];
@@ -1384,6 +1421,25 @@ void eqf_set_gyro_bias(float *g_off)
 	st.a_vec[2] = -Ab[2];
 }
 
+void eqf_rebase_gyro_bias(const float delta_dps[3])
+{
+	/* b_hat = -A^T*a_vec: b_hat += delta requires a_vec -= A*delta.
+	 * Preserve attitude, covariance, rest evidence and LP initialization. */
+	float delta[3] = {
+		delta_dps[0] * DEG_TO_RAD,
+		delta_dps[1] * DEG_TO_RAD,
+		delta_dps[2] * DEG_TO_RAD
+	};
+	float rotated_delta[3];
+	m3v(st.A, delta, rotated_delta);
+	for (int i = 0; i < 3; i++) {
+		st.a_vec[i] -= rotated_delta[i];
+		if (rest_gyr_lp_init) {
+			rest_gyr_lp[i] += delta[i];
+		}
+	}
+}
+
 void eqf_get_lin_a(float *lin_a)
 {
 	/* gravity direction in body frame = A^T · [0,0,1] = row 2 of A */
@@ -1409,11 +1465,14 @@ bool eqf_get_rest_detected(void)
 	return rest_detected;
 }
 
-void eqf_get_relative_rest_deviations(float out[2])
+static bool eqf_take_rest_observation(bool *out)
 {
-	float gyr_th_rad = EQF_REST_TH_GYR * DEG_TO_RAD;
-	out[0] = sqrtf(rest_gyr_dev) / gyr_th_rad;
-	out[1] = sqrtf(rest_acc_dev) / EQF_REST_TH_ACC;
+	bool pending = rest_observation_pending;
+	rest_observation_pending = false;
+	if (pending && out) {
+		*out = eqf_get_rest_detected();
+	}
+	return pending;
 }
 
 bool eqf_get_mag_dist_detected(void)
@@ -1421,11 +1480,17 @@ bool eqf_get_mag_dist_detected(void)
 	return mag_dist_detected;
 }
 
-void eqf_reset_mag_ref(void)
+static void eqf_rebase_mag(float norm, float dip)
 {
-	eqf_set_mag_ref(0.0f, 0.0f);
-	mag_ref_valid = false;
+	eqf_set_mag_ref(norm, dip);
+	mag_ref_valid = norm > 0.0f;
 	eqf_reset_mag_runtime_state(false);
+	mag_dist_detected = true;
+	mag_rebase_pending = true;
+	memset(mag_sum, 0, sizeof(mag_sum));
+	mag_norm_sum = 0.0f;
+	mag_init_count = 0;
+	have_mag = false;
 }
 
 void eqf_get_mag_ref(float *norm, float *dip)
@@ -1438,23 +1503,24 @@ void eqf_get_mag_ref(float *norm, float *dip)
 /* ── Fusion vtable ─────────────────────────────────────────────────── */
 
 const sensor_fusion_t sensor_fusion_eqf = {
-	.init             = eqf_init,
-	.load             = eqf_load,
-	.save             = eqf_save,
-	.update_gyro      = eqf_update_gyro,
-	.update_accel     = eqf_update_accel,
-	.update_mag       = eqf_update_mag,
-	.update           = eqf_update,
-	.get_gyro_bias    = eqf_get_gyro_bias,
-	.set_gyro_bias    = eqf_set_gyro_bias,
+	.init = eqf_init,
+	.load = eqf_load,
+	.save = eqf_save,
+	.update_gyro = eqf_update_gyro,
+	.update_accel = eqf_update_accel,
+	.update_mag = eqf_update_mag,
+	.update = eqf_update,
+	.get_gyro_bias = eqf_get_gyro_bias,
+	.set_gyro_bias = eqf_set_gyro_bias,
+	.rebase_gyro_bias = eqf_rebase_gyro_bias,
 	.update_gyro_sanity = eqf_update_gyro_sanity,
-	.get_gyro_sanity  = eqf_get_gyro_sanity,
-	.get_lin_a        = eqf_get_lin_a,
-	.get_quat         = eqf_get_quat,
+	.get_gyro_sanity = eqf_get_gyro_sanity,
+	.get_lin_a = eqf_get_lin_a,
+	.get_quat = eqf_get_quat,
 	.get_rest_detected = eqf_get_rest_detected,
-	.get_relative_rest_deviations = eqf_get_relative_rest_deviations,
+	.take_rest_observation = eqf_take_rest_observation,
 	.get_mag_dist_detected = eqf_get_mag_dist_detected,
-	.reset_mag_ref    = eqf_reset_mag_ref,
-	.set_mag_ref      = eqf_set_mag_ref,
-	.get_mag_ref      = eqf_get_mag_ref,
+	.get_quat6 = NULL, /* EqF attitude is magnetically coupled. */
+	.rebase_mag = eqf_rebase_mag,
+	.get_mag_ref = eqf_get_mag_ref,
 };

@@ -10,6 +10,59 @@ config USE_SLIMENRF_CONSOLE
     help
         Use basic console for commands.
 
+config LED_DEBUG
+    bool "Local LED appearance diagnostics"
+    default n
+    depends on USE_SLIMENRF_CONSOLE && (UART_CONSOLE || RTT_CONSOLE)
+    help
+        Enable bounded local LED previews and read-only diagnostics using the
+        existing console transport.
+
+config CUSTOMER_INFO
+    bool "Read CUSTOMER provenance"
+    depends on SOC_SERIES_NRF52
+    default y
+    select CRC
+    help
+        Report the generic SNCI record at CUSTOMER byte offset 64.
+        Read-only convention, not a reservation or ownership claim.
+        No UICR writes, boot gating, or authentication are performed.
+
+config CUSTOMER_INFO_CHECK_IDENTITY
+    bool "Compare CUSTOMER provenance with an explicit expected identity"
+    depends on CUSTOMER_INFO
+    default n
+    help
+        Diagnostic comparison only; mismatch never blocks startup.
+        Set the expected namespace, product and hardware revision explicitly.
+        A blank manufacturer namespace leaves identity not_checked.
+
+config CUSTOMER_INFO_EXPECTED_MANUFACTURER
+    string "Expected manufacturer namespace"
+    depends on CUSTOMER_INFO_CHECK_IDENTITY
+    help
+        Explicit namespace, not inferred from the firmware board name.
+        Use 1-7 uppercase letters/digits with optional internal single hyphens.
+        Leave blank to disable comparison.
+
+config CUSTOMER_INFO_EXPECTED_PRODUCT_ID
+    int "Expected product ID"
+    depends on CUSTOMER_INFO_CHECK_IDENTITY
+    range -1 65535
+    default -1
+    help
+        Explicit product ID in the expected manufacturer's namespace.
+        Minus one means unspecified and leaves identity not_checked.
+
+config CUSTOMER_INFO_EXPECTED_HARDWARE_REVISION
+    int "Expected hardware revision"
+    depends on CUSTOMER_INFO_CHECK_IDENTITY
+    range -1 65535
+    default -1
+    help
+        Explicit hardware revision; zero is a valid revision.
+        Minus one means unspecified and leaves identity not_checked.
+
 choice
 	prompt "Battery voltage mapping"
     default BATTERY_USE_REG_LDO_MAPPING
@@ -34,51 +87,59 @@ config BATTERY_NO_MAPPING
 
 endchoice
 
-choice
-	prompt "Status LED color mapping"
-    default LED_TRI_COLOR
-
-config LED_RGB_COLOR
-    bool "Use RGB color mapping"
-    help
-        Use RGB or RG color mapping for LED status if available.
-
-config LED_TRI_COLOR
-    bool "Use default color mapping"
-    help
-        Use the default color mapping for LED status.
-
-endchoice
-
-menu "Status LED default status color"
-    depends on LED_RGB_COLOR
-
-config LED_DEFAULT_COLOR_R
-    int "Red value"
+config LED_GLOBAL_BRIGHTNESS_PPTT
+    int "Global LED brightness (pptt)"
     range 0 10000
-    default 4000
-    depends on LED_RGB_COLOR
+    default 10000
     help
-        Red color for default status.
-        Valid range is 0 to 10000.
+        Scale LED output brightness in parts per ten-thousand.
+        0 is truly black on every controllable channel, including GPIO.
+        Nonzero GPIO output is binary rather than linearly dimmable.
+        10000 is full brightness, 2500 is 25%; board current limits still apply.
 
-config LED_DEFAULT_COLOR_G
-    int "Green value"
-    range 0 10000
-    default 6000
-    depends on LED_RGB_COLOR
+config LED_NETWORK_SYNC
+    bool "Synchronize ordinary status LEDs to receiver time"
+    depends on CONNECTION_TDMA
+    default y
     help
-        Green color for default status.
-        Valid range is 0 to 10000.
+        Share READY heartbeat and unmultiplexed CHARGE phase using fresh
+        receiver time. Other indications remain local. Raw 32-bit clock
+        wrap may alter one interval; subsequent periods are unchanged.
 
-config LED_DEFAULT_COLOR_B
-    int "Blue value"
-    range 0 10000
-    default 0
-    depends on LED_RGB_COLOR
+menu "Thread stack sizes"
+
+config LED_THREAD_STACK_SIZE
+    int "LED thread stack size"
+    default 1024 if LED_STRIP
+    default 512
     help
-        Blue color for default status.
-        Valid range is 0 to 10000.
+        Stack size of the LED thread. Strip updates run in the caller's
+        context. The linked I2S path measures at least 488 bytes before
+        omitted kernel/context costs; reserve headroom rather than fitting
+        that lower bound into 512 bytes. GPIO/PWM retain the smaller budget.
+
+config STATUS_THREAD_STACK_SIZE
+    int "Status thread stack size"
+    default 512
+    help
+        Stack size of the status thread. It publishes semantic fault facts;
+        only the LED worker runs hardware drivers.
+
+config USB_INIT_THREAD_STACK_SIZE
+    int "USB init thread stack size"
+    default 512
+    help
+        Stack size of the USB init thread. It registers the descriptors and
+        enables the USB device, and the USBD callbacks for the first bus
+        events (bus reset, configuration, VBUS) run in this context, so the
+        whole USB device stack init and enumeration path has to fit here.
+
+config USB_CTRL_THREAD_STACK_SIZE
+    int "USB control thread stack size"
+    default 512
+    help
+        Stack size of the USB control thread, which services CDC line state
+        changes and the DFU touch window.
 
 endmenu
 
@@ -190,16 +251,20 @@ config USE_IMU_TIMEOUT
 config IMU_TIMEOUT_RAMP_MIN
     int "Sensor timeout minimum delay (ms)"
     default 5000
+    range 5000 2147483647
     depends on USE_IMU_TIMEOUT || SENSOR_USE_LOW_POWER_2
     help
         Minimum timeout during no motion. Initial period on wake up.
+        At least 5000 ms to allow the wake-on-motion warning floor.
 
 config IMU_TIMEOUT_RAMP_MAX
     int "Sensor timeout maximum delay (ms)"
     default 15000
+    range 5000 2147483647
     depends on USE_IMU_TIMEOUT || SENSOR_USE_LOW_POWER_2
     help
         Maximum timeout during no motion.
+        At least 5000 ms to allow the wake-on-motion warning floor.
 
 config USE_ACTIVE_TIMEOUT
     bool "Use activity timeout"
@@ -237,9 +302,11 @@ config ACTIVE_TIMEOUT_THRESHOLD
 config ACTIVE_TIMEOUT_DELAY
     int "Activity timeout delay (ms)"
     default 1800000
+    range 5000 2147483647
     depends on USE_ACTIVE_TIMEOUT
     help
         Activity timeout duration when triggered.
+        At least 5000 ms to allow the wake-on-motion warning floor.
 
 config DYNAMIC_ACTIVE_TIMEOUT
     bool "Adapt activity timeout after wake-on-motion"
@@ -252,14 +319,18 @@ config DYNAMIC_ACTIVE_TIMEOUT
 config ACTIVE_TIMEOUT_IDLE_WAKE_DELAY
     int "Low-activity wake timeout (ms)"
     default 90000
-    range 1000 3600000
+    range 5000 3600000
     depends on DYNAMIC_ACTIVE_TIMEOUT
+    help
+        At least 5000 ms to allow the wake-on-motion warning floor.
 
 config ACTIVE_TIMEOUT_REPEAT_WAKE_DELAY
     int "Repeated low-activity wake timeout (ms)"
     default 90000
-    range 1000 3600000
+    range 5000 3600000
     depends on DYNAMIC_ACTIVE_TIMEOUT
+    help
+        At least 5000 ms to allow the wake-on-motion warning floor.
 
 config ACTIVE_TIMEOUT_REPEAT_WAKE_COUNT
     int "Low-activity wakes before shortest timeout"
@@ -437,13 +508,13 @@ config VQF_BENCH
         storage. Keep this disabled for normal firmware builds to avoid the
         extra RAM cost from static benchmark buffers.
 
-config SENSOR_USE_6_SIDE_CALIBRATION
-    bool "Use 6-side calibration"
+config SENSOR_USE_ACCEL_CALIBRATION
+    bool "Use 18-orientation accelerometer calibration"
     default y
     depends on USE_SLIMENRF_CONSOLE
     help
-        Use 6-side calibration for accelerometer.
-        Calibration can be completed through the basic console.
+        Use 18-orientation accelerometer matrix calibration.
+        Calibration can be completed through `calibrate acc` in the basic console.
 
 config SENSOR_USE_SENS_CALIBRATION
     bool "Use gyro sensitivity calibration"
@@ -548,6 +619,41 @@ config CONNECTION_OVER_HID
         Use HID if available.
         Otherwise, use ESB only.
 
+menu "Tracker event telemetry"
+
+config TRACKER_EVENT_CALIBRATION
+    bool "Calibration event telemetry"
+    default y
+    help
+        Publish calibration lifecycle, progress, result, and heartbeat events.
+        Disabling this option does not change calibration or logging.
+
+config TRACKER_EVENT_TRACKER_REST
+    bool "Tracker rest state telemetry"
+    default y
+    help
+        Publish tracker rest and motion state changes, unavailable state, and
+        periodic state refreshes. Does not change motion detection, sensor
+        power saving, or logging.
+
+config TRACKER_EVENT_FUSION_REST
+    bool "Fusion rest state telemetry"
+    default y
+    help
+        Publish fusion rest state changes, unavailable or unsupported state,
+        and periodic state refreshes. Does not change fusion, bias estimation,
+        or logging.
+
+config TRACKER_EVENT_POWER
+    bool "Power event telemetry"
+    default y
+    help
+        Publish boot, wake, watchdog reset, sleep, shutdown, reboot, and
+        wake-on-motion cancellation notices. Does not change power management
+        or logging. Button notices remain enabled independently.
+
+endmenu
+
 config SLIMEVR_USB_DEVICE_VID
     hex "SlimeVR USB vendor ID"
     default 0x1209
@@ -578,6 +684,25 @@ config SLIMEVR_USB_DEVICE_MAX_POWER
     default 100
     help
         USB bMaxPower value in 2 mA units.
+
+# Keep USB-only settings conditional for boards using a UART bridge instead.
+configdefault UDC_BUF_POOL_SIZE
+    default 4096 if UDC_DRIVER
+
+choice USBD_LOG_LEVEL_CHOICE
+    depends on USB_DEVICE_STACK_NEXT && LOG
+    default USBD_LOG_LEVEL_ERR
+endchoice
+
+choice UDC_DRIVER_LOG_LEVEL_CHOICE
+    depends on UDC_DRIVER && LOG
+    default UDC_DRIVER_LOG_LEVEL_ERR
+endchoice
+
+choice USBD_CDC_ACM_LOG_LEVEL_CHOICE
+    depends on USB_DEVICE_STACK_NEXT && USBD_CDC_ACM_CLASS && LOG
+    default USBD_CDC_ACM_LOG_LEVEL_OFF
+endchoice
 
 config CLOCK_USE_LFXO
     bool "Use external low-frequency crystal oscillator (LFXO)"
@@ -632,11 +757,50 @@ config CLOCK_USE_LF_SYNTH
         Use the LF synthesizer (derived from HFXO) for the low-frequency
         clock instead of LFXO or LFRC.
 
+# GRTC selects its LF source independently of the system LFCLK. Match the
+# application's clock policy instead of inheriting the temporary RC boot source.
+# Select at driver initialization; do not retime the running kernel counter.
+if NRF_GRTC_TIMER && NRF_GRTC_START_SYSCOUNTER
+
+choice NRF_GRTC_TIMER_SOURCE
+    default NRF_GRTC_TIMER_SOURCE_LFXO if CLOCK_USE_LFXO
+    default NRF_GRTC_TIMER_SOURCE_SYSTEM_LFCLK if CLOCK_USE_LF_SYNTH
+    default NRF_GRTC_TIMER_SOURCE_LFLPRC
+endchoice
+
+endif
+
 config CLOCK_CONTROL_NRF_K32SRC_RC_CALIBRATION
     bool "Enable RC oscillator calibration for K32SRC"
     default y if CLOCK_USE_LF_SYNTH && CONNECTION_TDMA
+
+menu "TDMA diagnostics"
+
+config TDMA_DIAGNOSTICS
+    bool "Compile in TDMA/RF radio capture diagnostics"
     default n
+    help
+        RADIO READY/ADDRESS/END hardware timestamp capture, PING
+        transaction capture and the tdma stats / tdma capture console
+        commands. Disable for production builds: reclaims ~5 KB RAM
+        and removes the capture hook from the ESB transmit path.
+        TDMA scheduling itself stays fully functional without this
+        option; only measurement instrumentation is removed at compile
+        time. The admission/guard counters shown by "tdma stats" are
+        also compiled out with this option.
+
+endmenu
+
+config ESB_OTA_FORCE_RAM_ENGINE
+    bool "Force nRF52840 OTA RAM engine test profile"
+    default n
+    depends on SOC_NRF52840 && !BOOTLOADER_MCUBOOT
+    help
+        Use the native in-place RAM OTA engine on nRF52840 for reliability
+        testing. Production nRF52840 OTA keeps the staging-area path unless
+        this opt-in test profile is explicitly enabled.
 
 rsource "Kconfig.sensors_drivers"
+rsource "Kconfig.heater"
 
 source "Kconfig.zephyr"

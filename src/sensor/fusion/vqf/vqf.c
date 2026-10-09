@@ -47,6 +47,8 @@
 #define RAD_TO_DEG 57.29577951308232087680f /* (float)(180.0 / M_PI) */
 #endif
 
+static bool rest_observation_pending;
+
 #if IS_ENABLED(CONFIG_VQF_ADAPTIVE_TAU_ACC)
 /* ---------- Adaptive tauAcc configuration ---------- */
 /*
@@ -166,35 +168,36 @@ void vqf_update_sensor_ids(int imu)
 static void set_params()
 {
 	init_params(&params);
-	params.tauAcc = 3.8f;
+	params.tauAcc = 1.011f;
 	params.biasClip = 5.0f;
-	params.biasForgettingTime = 100.0f;
-	params.biasSigmaInit = 0.8f;
-	params.biasSigmaMotion = 0.28f;
-	params.biasSigmaRest = 0.05f;
+	params.biasForgettingTime = 325.0f;
+	params.biasSigmaInit = 1.55f;
+	params.biasSigmaMotion = 0.1053f;
+	params.biasSigmaRest = 0.0108f;
 	params.biasVerticalForgettingFactor = 0.0001f;
 	params.motionBiasEstEnabled = true;
 	params.restBiasEstEnabled = true;
-	params.restFilterTau = 1.34f;
-	params.restMinT = 2.8f;
-	params.restThGyr = 0.8f;
-	params.restThAcc = 0.08f;
+	params.restFilterTau = 2.6f;
+	params.restMinT = 0.25f;
+	params.restThGyr = 0.4f;
+	params.restThAcc = 0.1f;
 	params.magDistRejectionEnabled = true;
 	params.tauMag = 9.0f;
-	params.magCurrentTau = 0.50f;
+	params.magCurrentTau = 0.20f;
 	params.magNormTh = 0.10f;
-	params.magDipTh = 4.0f;
+	params.magDipTh = 5.0f;
 	params.magRefTau = 10.0f;
-	params.magNewTime = 3.0f;
-	params.magNewFirstTime = 3.0f;
-	params.magNewMinGyr = 20.0f;
+	params.magNewTime = 15.0f;
+	params.magNewFirstTime = 5.0f;
+	params.magNewMinGyr = 10.0f;
 	params.magMinUndisturbedTime = 0.5f;
-	params.magMaxRejectionTime = 3200.0f;
-	params.magRejectionFactor = 1150.0f;
+	params.magMaxRejectionTime = 60.0f;
+	params.magRejectionFactor = 1000.0f;
 }
 
 void vqf_init(float g_time, float a_time, float m_time)
 {
+	rest_observation_pending = false;
 	set_params();
 	vqf_init_gyr_time = g_time;
 	vqf_init_acc_time = a_time;
@@ -272,6 +275,7 @@ static float vqf_safe_init_time(float saved_time, float loaded_time)
 
 void vqf_load(const void *data)
 {
+	rest_observation_pending = false;
 	BUILD_ASSERT(
 		VQF_MEM_SIZE <= sizeof(((struct retained_data *)0)->fusion_data),
 		"VQF state+coeffs exceeds fusion_data buffer in retained memory"
@@ -327,6 +331,7 @@ void vqf_update_gyro(float *g, float time)
 	}
 	/* Fixed coeffs->gyrTs path (caller-dt / lastGyrTsUs synth disabled for A/B). */
 	updateGyr(&params, &state, &coeffs, g_rad);
+	rest_observation_pending = true;
 }
 
 #if IS_ENABLED(CONFIG_VQF_ADAPTIVE_TAU_ACC)
@@ -455,6 +460,9 @@ void vqf_update_accel(float *a, float time)
 #endif
 	/* Fixed coeffs->accTs path (caller-dt / lastAccTsUs synth disabled for A/B). */
 	updateAcc(&params, &state, &coeffs, a_m_s2);
+	if (a_m_s2[0] != 0 || a_m_s2[1] != 0 || a_m_s2[2] != 0) {
+		rest_observation_pending = true;
+	}
 	vqf_track_rest_diag();
 }
 
@@ -511,6 +519,59 @@ void vqf_set_gyro_bias(float *g_off)
 	setBiasEstimate(&state, g_off_rad, -1);
 }
 
+void vqf_rebase_gyro_bias(const float delta_dps[3])
+{
+	/* Change input coordinates, not the physical bias estimate. Do not use
+	 * setBiasEstimate(), reset covariance, or clip the translated residual. */
+	vqf_real_t delta[3];
+	for (int i = 0; i < 3; i++) {
+		delta[i] = delta_dps[i] * DEG_TO_RAD;
+		state.bias[i] += delta[i];
+		state.restLastGyrLp[i] += delta[i];
+	}
+
+	/* filterVec initially stores [NaN, count, sums...], then switches to
+	 * transposed direct-form II pairs. No samples means all-NaN: leave it
+	 * untouched so the first sample initializes in the new coordinates.
+	 * Use the bit-based finite check even for the native NaN markers. */
+	if (!vqf_float_finite((float)state.restGyrLpState[0])) {
+		if (vqf_float_finite((float)state.restGyrLpState[1])) {
+			for (int i = 0; i < 3; i++) {
+				state.restGyrLpState[2 + i] += state.restGyrLpState[1] * (vqf_double_t)delta[i];
+			}
+		}
+	} else {
+		for (int i = 0; i < 3; i++) {
+			state.restGyrLpState[2 * i] += (vqf_double_t)delta[i] * ((vqf_double_t)1 - coeffs.restGyrLpB[0]);
+			state.restGyrLpState[2 * i + 1] += (vqf_double_t)delta[i] * (coeffs.restGyrLpB[2] - coeffs.restGyrLpA[1]);
+		}
+	}
+
+	/* LP(R*b) becomes LP(R*b) + LP(R)*delta. Both native filters advance
+	 * together, including their averaging/count initialization. Translate
+	 * the two earth-horizontal rows using their actual R history, not the
+	 * current attitude or a constant steady-state approximation. */
+	if (!vqf_float_finite((float)state.motionBiasEstBiasLpState[0])) {
+		if (vqf_float_finite((float)state.motionBiasEstBiasLpState[1])) {
+			for (int row = 0; row < 2; row++) {
+				for (int col = 0; col < 3; col++) {
+					state.motionBiasEstBiasLpState[2 + row] +=
+						state.motionBiasEstRLpState[2 + 3 * row + col] * (vqf_double_t)delta[col];
+				}
+			}
+		}
+	} else {
+		for (int row = 0; row < 2; row++) {
+			for (int col = 0; col < 3; col++) {
+				for (int k = 0; k < 2; k++) {
+					state.motionBiasEstBiasLpState[2 * row + k] +=
+						state.motionBiasEstRLpState[2 * (3 * row + col) + k] * (vqf_double_t)delta[col];
+				}
+			}
+		}
+	}
+}
+
 void vqf_update_gyro_sanity(float *g, float *m)
 {
 	// TODO: does vqf tell us a "recovery state"
@@ -549,19 +610,43 @@ bool vqf_get_rest_detected(void)
 	return getRestDetected(&state);
 }
 
+static bool vqf_take_rest_observation(bool *out)
+{
+	bool pending = rest_observation_pending;
+	rest_observation_pending = false;
+	if (pending && out) {
+		*out = vqf_get_rest_detected();
+	}
+	return pending;
+}
+
 bool vqf_get_mag_dist_detected(void)
 {
 	return getMagDistDetected(&state);
 }
 
-void vqf_reset_mag_ref(void)
-{
-	setMagRef(&state, 0, 0);
-}
-
-void vqf_set_mag_ref(float norm, float dip)
+static void vqf_rebase_mag(float norm, float dip)
 {
 	setMagRef(&state, norm, dip);
+	state.magDistDetected = true;
+	state.magUndisturbedT = 0.0f;
+	state.magRejectT = 0.0f;
+	state.magCandidateNorm = -1.0f;
+	state.magCandidateDip = 0.0f;
+	state.magCandidateT = 0.0f;
+	state.magNormDip[0] = state.magNormDip[1] = 0.0f;
+	for (unsigned i = 0; i < 4; i++) {
+		state.magNormDipLpState[i] = NAN;
+	}
+	state.kMagInit = 0.0f;
+	state.lastMagDisAngle = 0.0f;
+	state.lastMagCorrAngularRate = 0.0f;
+	state.lastMagTsUs = 0;
+}
+
+static void vqf_get_quat6(float *q)
+{
+	getQuat6D(&state, q);
 }
 
 float vqf_get_mag_ref_norm(void)
@@ -583,11 +668,6 @@ float vqf_get_delta(void)
 void vqf_set_delta(float delta)
 {
 	state.delta = delta;
-}
-
-void vqf_get_relative_rest_deviations(float *out)
-{
-	getRelativeRestDeviations(&params, &state, out);
 }
 
 void vqf_get_debug_info(vqf_debug_info_t *info)
@@ -960,6 +1040,7 @@ const sensor_fusion_t sensor_fusion_vqf = {
 
 	.get_gyro_bias = vqf_get_gyro_bias,
 	.set_gyro_bias = vqf_set_gyro_bias,
+	.rebase_gyro_bias = vqf_rebase_gyro_bias,
 
 	.update_gyro_sanity = vqf_update_gyro_sanity,
 	.get_gyro_sanity = vqf_get_gyro_sanity,
@@ -968,9 +1049,9 @@ const sensor_fusion_t sensor_fusion_vqf = {
 	.get_quat = vqf_get_quat,
 
 	.get_rest_detected = vqf_get_rest_detected,
-	.get_relative_rest_deviations = vqf_get_relative_rest_deviations,
+	.take_rest_observation = vqf_take_rest_observation,
 	.get_mag_dist_detected = vqf_get_mag_dist_detected,
-	.reset_mag_ref = vqf_reset_mag_ref,
-	.set_mag_ref = vqf_set_mag_ref,
+	.get_quat6 = vqf_get_quat6,
+	.rebase_mag = vqf_rebase_mag,
 	.get_mag_ref = vqf_get_mag_ref,
 };

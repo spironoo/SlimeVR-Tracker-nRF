@@ -26,11 +26,27 @@
 #include <zephyr/kernel.h>
 
 #include <stdbool.h>
+#include <stdint.h>
+
+enum sensor_calibration_sample_channel {
+	CAL_SAMPLE_ACCEL = 1 << 0,
+	CAL_SAMPLE_GYRO = 1 << 1,
+	CAL_SAMPLE_MAG = 1 << 2,
+};
+
+/* Calibration-thread owner only, with no pending sample wait. Each boundary
+ * discards all queued vectors, including an in-flight prior-session publish.
+ * Only selected channels enqueue; the live accel peek always remains available. */
+void sensor_calibration_samples_begin(uint8_t channels);
+void sensor_calibration_samples_end(void);
 
 void sensor_sample_accel(const float a[3]);
 int sensor_wait_accel(float a[3], k_timeout_t timeout);
 /* Non-blocking: copy last accel sample if any has been published. */
 bool sensor_peek_accel(float a[3]);
+#if CONFIG_SENSOR_TCAL_HEATED
+bool sensor_peek_accel_fresh(float a[3], int64_t max_age_ms);
+#endif
 void sensor_sample_gyro(const float g[3]);
 int sensor_wait_gyro(float g[3], k_timeout_t timeout);
 void sensor_sample_mag(const float m[3]);

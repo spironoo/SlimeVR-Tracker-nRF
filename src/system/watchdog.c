@@ -5,20 +5,21 @@
  */
 
 #include <zephyr/kernel.h>
+#include "watchdog.h"
+#include "system/system.h"
+#include "globals.h"
 
+#include <hal/nrf_power.h>
 /* Only compile when Task WDT is enabled */
 #if defined(CONFIG_TASK_WDT)
 
-#include "watchdog.h"
-#include "globals.h"
-#include "system/system.h"
+static bool boot_success_marked;
 #include <zephyr/task_wdt/task_wdt.h>
 #include <zephyr/drivers/watchdog.h>
 #include <zephyr/device.h>
 #include <zephyr/init.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/sys/reboot.h>
-#include <hal/nrf_power.h>
 
 LOG_MODULE_REGISTER(watchdog, LOG_LEVEL_INF);
 
@@ -46,7 +47,6 @@ static uint32_t channel_timeouts[WDT_CHANNEL_COUNT];
 
 /* Watchdog state */
 static bool watchdog_initialized = false;
-static bool boot_success_marked = false;
 static uint8_t saved_gpregret = 0;  /* Saved at PRE_KERNEL for OTA debug */
 
 /* Channel names for logging */
@@ -61,9 +61,6 @@ static const char *channel_names[] = {
 	"calibration",
 	"scan"
 };
-
-/* Store WDT reset status before RESETREAS is cleared by early_check */
-static bool last_reset_was_wdt = false;
 
 /* Default timeout values in milliseconds */
 static const uint32_t default_timeouts[] = {
@@ -141,8 +138,8 @@ static void watchdog_timeout_callback(int channel_id, void *user_data)
  */
 static bool should_enter_dfu(void)
 {
-	/* Use saved WDT reset status (RESETREAS was cleared in early_check) */
-	if (!last_reset_was_wdt) {
+	/* Reset causes remain available after the boot snapshot clears hardware. */
+	if (!watchdog_caused_reset()) {
 		return false;
 	}
 
@@ -197,26 +194,16 @@ static void enter_dfu_mode(void)
 }
 
 /**
- * @brief Early check for WDT reset (must be called before RESETREAS is cleared)
+ * @brief Save OTA diagnostics before later startup code changes GPREGRET
  */
 static int watchdog_early_check(void)
 {
-	/* Check if last reset was caused by watchdog - save for later use */
-	last_reset_was_wdt = watchdog_caused_reset();
-
 	/* Save GPREGRET for OTA RAM engine debug (survives system reset) */
 	saved_gpregret = nrf_power_gpregret_get(NRF_POWER, 0) & 0xFF;
 	if (saved_gpregret >= 0xD0 && saved_gpregret <= 0xDE) {
 		/* Clear it so bootloader doesn't see it on next reset */
 		nrf_power_gpregret_set(NRF_POWER, 0, 0);
 	}
-
-	/* Clear reset reason flags early to prevent other code from seeing stale values */
-#ifdef NRF_RESET
-	NRF_RESET->RESETREAS = NRF_RESET->RESETREAS;
-#else
-	NRF_POWER->RESETREAS = NRF_POWER->RESETREAS;
-#endif
 
 	return 0;
 }
@@ -237,18 +224,20 @@ int watchdog_init(void)
 	}
 
 	/* Process WDT reset state */
-	if (last_reset_was_wdt && retained) {
+	if (watchdog_caused_reset() && retained) {
 		LOG_WRN("System was reset by watchdog!");
 
 		/* Check if watchdog_state is valid (magic number matches) */
 		bool state_valid = (retained->watchdog_state.magic == WATCHDOG_STATE_MAGIC);
 
 		if (state_valid) {
-			/* Increment reset counter */
-			retained->watchdog_state.reset_count++;
+			if (!sys_bootloader_supports_recovery()) {
+				/* Legacy loaders leave the consecutive-reset policy to us. */
+				retained->watchdog_state.reset_count++;
+			}
 			retained->watchdog_state.total_wdt_resets++;
 			LOG_WRN("WDT reset count: %d (total: %d)",
-				retained->watchdog_state.reset_count,
+				watchdog_get_reset_count(),
 				retained->watchdog_state.total_wdt_resets);
 
 			/* Log last failed channel */
@@ -257,40 +246,42 @@ int watchdog_init(void)
 					channel_names[retained->watchdog_state.last_failed_channel]);
 			}
 
-			/* Check if we should enter DFU due to repeated WDT resets */
-			if (should_enter_dfu()) {
+			/* New loaders already own escalation; never count it twice. */
+			if (!sys_bootloader_supports_recovery() && should_enter_dfu()) {
 				enter_dfu_mode();
 				return 1;  /* Won't reach here */
 			}
 		} else {
 			/* First WDT reset or corrupted state - initialize */
 			LOG_WRN("WDT state not valid, initializing");
-			retained->watchdog_state.reset_count = 1;
+			if (!sys_bootloader_supports_recovery()) {
+				retained->watchdog_state.reset_count = 1;
+			}
 			retained->watchdog_state.total_wdt_resets = 1;
 			retained->watchdog_state.magic = WATCHDOG_STATE_MAGIC;
 		}
 	} else if (retained) {
-		/* Non-WDT reset - clear counter but keep magic */
-		retained->watchdog_state.reset_count = 0;
+		if (!sys_bootloader_supports_recovery()) {
+			/* Non-WDT reset ends a legacy consecutive-reset streak. */
+			retained->watchdog_state.reset_count = 0;
+		}
 		retained->watchdog_state.magic = WATCHDOG_STATE_MAGIC;
 	}
 
 	/* Get the hardware WDT device */
 	const struct device *wdt_dev = DEVICE_DT_GET(WATCHDOG_NODE);
 	if (!device_is_ready(wdt_dev)) {
-		LOG_WRN("WDT device not ready, watchdog disabled");
-		/* Don't fail - allow system to boot without watchdog */
+		LOG_ERR("WDT device not ready");
 		watchdog_initialized = false;
-		return 0;
+		return -ENODEV;
 	}
 
 	/* Initialize Task WDT with the hardware WDT device */
 	int err = task_wdt_init(wdt_dev);
 	if (err < 0) {
 		LOG_ERR("Failed to initialize task WDT: %d", err);
-		/* Don't fail - allow system to boot without watchdog */
 		watchdog_initialized = false;
-		return 0;
+		return err;
 	}
 
 	watchdog_initialized = true;
@@ -321,12 +312,11 @@ SYS_INIT(watchdog_sys_init, APPLICATION, 99);
 int watchdog_register_thread(wdt_channel_id_t channel, uint32_t timeout_ms)
 {
 	if (!watchdog_initialized) {
-		/* Silently skip if watchdog not initialized - may be called before init */
-		LOG_WRN("%s: Watchdog not initialized, skipping", __func__);
-		return 0;
+		LOG_ERR("%s: Watchdog not initialized", __func__);
+		return -ENODEV;
 	}
 
-	if (channel >= WDT_CHANNEL_COUNT) {
+	if ((unsigned int)channel >= WDT_CHANNEL_COUNT) {
 		return -EINVAL;
 	}
 
@@ -335,8 +325,10 @@ int watchdog_register_thread(wdt_channel_id_t channel, uint32_t timeout_ms)
 		timeout_ms = default_timeouts[channel];
 	}
 
-	/* Save timeout for pause/resume functionality */
-	channel_timeouts[channel] = timeout_ms;
+	/* An already registered channel must not leak another task WDT slot. */
+	if (channel_ids[channel] >= 0) {
+		return channel_ids[channel];
+	}
 
 	int id = task_wdt_add(timeout_ms, watchdog_timeout_callback,
 			      (void *)(intptr_t)channel);
@@ -346,6 +338,7 @@ int watchdog_register_thread(wdt_channel_id_t channel, uint32_t timeout_ms)
 	}
 
 	channel_ids[channel] = id;
+	channel_timeouts[channel] = timeout_ms;
 
 	/* Feed immediately after registration to reset the timeout counter */
 	task_wdt_feed(id);
@@ -357,14 +350,14 @@ int watchdog_register_thread(wdt_channel_id_t channel, uint32_t timeout_ms)
 
 void watchdog_feed(wdt_channel_id_t channel)
 {
-	if (channel < WDT_CHANNEL_COUNT && channel_ids[channel] >= 0) {
+	if (watchdog_initialized && (unsigned int)channel < WDT_CHANNEL_COUNT && channel_ids[channel] >= 0) {
 		task_wdt_feed(channel_ids[channel]);
 	}
 }
 
 void watchdog_pause(wdt_channel_id_t channel)
 {
-	if (channel < WDT_CHANNEL_COUNT && channel_ids[channel] >= 0) {
+	if (watchdog_initialized && (unsigned int)channel < WDT_CHANNEL_COUNT && channel_ids[channel] >= 0) {
 		/* Task WDT doesn't directly support pause, so we delete and re-add later */
 		int err = task_wdt_delete(channel_ids[channel]);
 		if (err == 0) {
@@ -377,66 +370,23 @@ void watchdog_pause(wdt_channel_id_t channel)
 
 void watchdog_resume(wdt_channel_id_t channel)
 {
-	if (channel < WDT_CHANNEL_COUNT && channel_ids[channel] < 0) {
+	if ((unsigned int)channel < WDT_CHANNEL_COUNT && (!watchdog_initialized || channel_ids[channel] < 0)) {
 		/* Re-register the channel with saved timeout (or default if not set) */
 		uint32_t timeout = channel_timeouts[channel];
 		if (timeout == 0) {
 			timeout = default_timeouts[channel];
 		}
-		watchdog_register_thread(channel, timeout);
+		if (watchdog_register_thread(channel, timeout) < 0) {
+			LOG_ERR("Failed to resume watchdog channel %s", channel_names[channel]);
+			sys_reboot(SYS_REBOOT_COLD);
+			return;
+		}
 		LOG_DBG("Watchdog channel %s resumed with %u ms timeout",
 			channel_names[channel], timeout);
 	}
 }
 
-bool watchdog_caused_reset(void)
-{
-#ifdef NRF_RESET
-	uint32_t reset_reason = NRF_RESET->RESETREAS;
-	uint32_t watchdog_mask = 0;
 
-#ifdef RESET_RESETREAS_DOG_Msk
-	watchdog_mask |= RESET_RESETREAS_DOG_Msk;
-#endif
-#ifdef RESET_RESETREAS_DOG0_Msk
-	watchdog_mask |= RESET_RESETREAS_DOG0_Msk;
-#endif
-#ifdef RESET_RESETREAS_DOG1_Msk
-	watchdog_mask |= RESET_RESETREAS_DOG1_Msk;
-#endif
-	return (reset_reason & watchdog_mask) != 0;
-#else
-	uint32_t reset_reason = NRF_POWER->RESETREAS;
-	return (reset_reason & POWER_RESETREAS_DOG_Msk) != 0;
-#endif
-}
-
-uint8_t watchdog_get_reset_count(void)
-{
-	if (retained) {
-		return retained->watchdog_state.reset_count;
-	}
-	return 0;
-}
-
-void watchdog_clear_reset_count(void)
-{
-	if (retained) {
-		retained->watchdog_state.reset_count = 0;
-		/* Update retained data to persist the change */
-		retained_update();
-	}
-	LOG_INF("WDT reset count cleared");
-}
-
-void watchdog_mark_boot_success(void)
-{
-	if (!boot_success_marked) {
-		boot_success_marked = true;
-		watchdog_clear_reset_count();
-		LOG_INF("Boot success marked, WDT reset count cleared");
-	}
-}
 
 void watchdog_suspend_all(void)
 {
@@ -463,3 +413,83 @@ const char *watchdog_get_channel_name(wdt_channel_id_t channel)
 }
 
 #endif /* CONFIG_TASK_WDT */
+
+#if defined(CONFIG_TASK_WDT) || ADAFRUIT_FAULT_RECOVERY
+uint8_t watchdog_get_reset_count(void)
+{
+#if ADAFRUIT_FAULT_RECOVERY
+	if (sys_bootloader_supports_recovery()) {
+		uint32_t recovery = NRF_POWER->GPREGRET;
+		return recovery == ADAFRUIT_WDT_RETRY_1 ? 1 :
+		       recovery == ADAFRUIT_WDT_RETRY_2 ? 2 : 0;
+	}
+#endif
+#if defined(CONFIG_TASK_WDT)
+	if (retained) {
+		return retained->watchdog_state.reset_count;
+	}
+#endif
+	return 0;
+}
+
+void watchdog_clear_reset_count(void)
+{
+#if ADAFRUIT_FAULT_RECOVERY
+	if (sys_bootloader_supports_recovery()) {
+		unsigned int key = irq_lock();
+		uint32_t recovery = NRF_POWER->GPREGRET;
+		if (recovery == ADAFRUIT_WDT_RETRY_1 || recovery == ADAFRUIT_WDT_RETRY_2) {
+			NRF_POWER->GPREGRET = 0;
+		}
+		irq_unlock(key);
+		return;
+	}
+#endif
+#if defined(CONFIG_TASK_WDT)
+	if (retained) {
+		retained->watchdog_state.reset_count = 0;
+		retained_update();
+	}
+	LOG_INF("WDT reset count cleared");
+#endif
+}
+
+void watchdog_mark_boot_success(void)
+{
+#if ADAFRUIT_FAULT_RECOVERY
+	if (sys_bootloader_supports_recovery()) {
+		watchdog_clear_reset_count();
+		return;
+	}
+#endif
+#if defined(CONFIG_TASK_WDT)
+	if (!boot_success_marked) {
+		boot_success_marked = true;
+		watchdog_clear_reset_count();
+		LOG_INF("Boot success marked, WDT reset count cleared");
+	}
+#endif
+}
+#endif
+
+bool watchdog_caused_reset(void)
+{
+#ifdef NRF_RESET
+	uint32_t reset_reason = sys_get_reset_reason();
+	uint32_t watchdog_mask = 0;
+
+#ifdef RESET_RESETREAS_DOG_Msk
+	watchdog_mask |= RESET_RESETREAS_DOG_Msk;
+#endif
+#ifdef RESET_RESETREAS_DOG0_Msk
+	watchdog_mask |= RESET_RESETREAS_DOG0_Msk;
+#endif
+#ifdef RESET_RESETREAS_DOG1_Msk
+	watchdog_mask |= RESET_RESETREAS_DOG1_Msk;
+#endif
+	return (reset_reason & watchdog_mask) != 0;
+#else
+	uint32_t reset_reason = sys_get_reset_reason();
+	return (reset_reason & POWER_RESETREAS_DOG_Msk) != 0;
+#endif
+}

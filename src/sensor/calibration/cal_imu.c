@@ -24,8 +24,10 @@
 #include "sensor/sensor.h"
 #include "system/system.h"
 #include "util.h"
+#include "connection/tracker_events.h"
 
 #include <math.h>
+#include <errno.h>
 #include <string.h>
 
 #include "sensor/sensors_enum.h"
@@ -46,27 +48,53 @@
 
 LOG_MODULE_REGISTER(cal_imu, LOG_LEVEL_INF);
 
-/* Owned by calibration.c */
-extern float accelBias[3];
-extern float gyroBias[3];
-#if CONFIG_SENSOR_USE_6_SIDE_CALIBRATION
-extern float accBAinv[4][3];
-#endif
+static void imu_step(uint16_t operation_id, struct led_token feedback, uint8_t phase)
+{
+	cal_event_step(operation_id, phase, 0);
+	sensor_calibration_stage(feedback,
+		phase == CAL_PHASE_COLLECT ? LED_COLLECT_STILL : LED_PROCESSING);
+	if (operation_id) {
+		tracker_events_notify();
+	}
+}
+
+static void imu_failed(uint16_t operation_id, struct led_token feedback, uint8_t phase, uint8_t reason)
+{
+	cal_event_end(operation_id, CAL_OUTCOME_FAILED, phase, reason);
+	sensor_calibration_result(feedback, LED_FAILED);
+	if (operation_id) {
+		tracker_events_notify();
+	}
+}
+
+static void imu_cancelled(uint16_t operation_id, struct led_token feedback)
+{
+	cal_event_end(operation_id, CAL_OUTCOME_CANCELLED, CAL_PHASE_APPLY_PENDING, CAL_REASON_RESET);
+	sensor_calibration_result(feedback, LED_CANCELLED);
+	if (operation_id) {
+		tracker_events_notify();
+	}
+}
+
 
 void sensor_calibrate_imu(void)
 {
-	float a_bias[3], g_bias[3];
+	const uint16_t operation_id = sensor_calibration_current_operation();
+	const struct led_token feedback = sensor_calibration_current_feedback();
+	const uint32_t generation = sensor_calibration_current_generation();
+	int prior_error = 0;
+	float a_bias[3] = {0}, g_bias[3] = {0};
 	LOG_INF("Calibrating main accelerometer and gyroscope zero rate offset");
 	LOG_INF("Rest the device on a stable surface");
 
-	set_led(SYS_LED_PATTERN_LONG, SYS_LED_PRIORITY_SENSOR);
+	sensor_calibration_stage(feedback, LED_WAIT_STILL);
 	if (!wait_for_motion(false, 6)) // Wait for accelerometer to settle, timeout 3s
 	{
-		set_led(SYS_LED_PATTERN_OFF, SYS_LED_PRIORITY_SENSOR);
+		imu_failed(operation_id, feedback, CAL_PHASE_WAIT_STILL, CAL_REASON_MOTION);
 		return; // Timeout, calibration failed
 	}
 
-	set_led(SYS_LED_PATTERN_ON, SYS_LED_PRIORITY_SENSOR);
+	sensor_calibration_stage(feedback, LED_COLLECT_STILL);
 	k_msleep(500); // Delay before beginning acquisition
 
 #if CONFIG_SENSOR_USE_TCAL
@@ -78,27 +106,47 @@ void sensor_calibrate_imu(void)
 #if IS_ENABLED(CONFIG_SENSOR_DRV_BMI270)
 	if (sensor_calibration_get_imu_id() == IMU_BMI270) // bmi270 specific
 	{
+		imu_step(operation_id, feedback, CAL_PHASE_SENSOR_RETRIM);
 		uint8_t *sensor_data = sensor_calibration_get_sensor_data();
 		LOG_INF("Suspending sensor thread");
-		main_imu_suspend();
+		int suspend_err = main_imu_suspend();
+		if (suspend_err) {
+			LOG_ERR("Cannot safely suspend for IMU retrim: %d", suspend_err);
+			imu_failed(operation_id, feedback, CAL_PHASE_SENSOR_RETRIM, CAL_REASON_SENSOR_UNAVAILABLE);
+			return;
+		}
 		LOG_INF("Running BMI270 component retrimming");
 		int err = bmi_crt(sensor_data); // will automatically reinitialize // TODO: this blocks sensor!
 		LOG_INF("Resuming sensor thread");
 		main_imu_resume();
 		if (err) {
 			LOG_WRN("IMU specific calibration was not completed properly");
-			set_led(SYS_LED_PATTERN_OFF, SYS_LED_PRIORITY_SENSOR);
+			imu_failed(operation_id, feedback, CAL_PHASE_SENSOR_RETRIM, CAL_REASON_SENSOR_UNAVAILABLE);
 			return; // Calibration failed
 		}
 		LOG_INF("Finished IMU specific calibration");
-		sys_write(MAIN_SENSOR_DATA_ID, &retained->sensor_data, sensor_data, sizeof(retained->sensor_data));
-		sensor_fusion_invalidate(); // only invalidate fusion if calibration was successful
+		sys_warm_transaction_begin();
+		if (!sensor_calibration_generation_valid(generation)) {
+			sys_warm_transaction_end(false);
+			imu_cancelled(operation_id, feedback);
+			return;
+		}
+		int storage_err = sys_write(MAIN_SENSOR_DATA_ID, &retained->sensor_data, sensor_data, sizeof(retained->sensor_data));
+		if (storage_err < 0) {
+			prior_error = storage_err;
+			cal_event_step(operation_id, CAL_PHASE_STORAGE, CAL_REASON_STORAGE_ERROR);
+			if (operation_id) {
+				tracker_events_notify();
+			}
+		}
+		sys_warm_transaction_end(false);
+		sensor_request_fusion_reset(false); // apply reset on the sensor's next frame
 		k_msleep(500);              // Delay before beginning acquisition
 	}
 #endif
 
 	LOG_INF("Reading data");
-	sensor_calibration_clear(a_bias, g_bias, false);
+	imu_step(operation_id, feedback, CAL_PHASE_COLLECT);
 #if CONFIG_SENSOR_USE_TCAL
 	int err = sensor_offsetBias(a_bias, g_bias, &avg_temp, &temp_range);
 #else
@@ -109,42 +157,63 @@ void sensor_calibrate_imu(void)
 		if (err == -1) {
 			LOG_INF("Motion detected");
 		} else if (err == -2) {
-			LOG_WRN("Calibration sampling failed (timeout or insufficient samples)");
+			LOG_WRN("Calibration sampling timed out");
 		} else if (err == -3) {
 			LOG_INF("Temperature instability detected");
+		} else if (err == BIAS_COLLECT_INSUFFICIENT_SAMPLES) {
+			LOG_WRN("Calibration sampling completed with insufficient samples");
 		} else {
 			LOG_WRN("Calibration failed: %d", err);
 		}
 		/* Do not run NAN-through-validate: CMSIS v_epsilon can treat NaN as
 		 * in-range and then apply cleared zero bias to NVS/fusion. */
-		set_led(SYS_LED_PATTERN_OFF, SYS_LED_PRIORITY_SENSOR);
-		LOG_INF("Restoring previous calibration");
-		LOG_INF("Gyroscope bias: %.5f %.5f %.5f", (double)gyroBias[0], (double)gyroBias[1], (double)gyroBias[2]);
-		sensor_calibration_validate(NULL, NULL, true); // verify old calibration still sane
+		LOG_INF("Previous calibration unchanged");
+		imu_failed(operation_id, feedback, CAL_PHASE_COLLECT,
+			   err == -1 ? CAL_REASON_MOTION : err == -2 ? CAL_REASON_SAMPLE_TIMEOUT :
+			   err == -3 ? CAL_REASON_TEMPERATURE :
+			   err == BIAS_COLLECT_INSUFFICIENT_SAMPLES ? CAL_REASON_INSUFFICIENT_SAMPLES :
+			   CAL_REASON_SENSOR_UNAVAILABLE);
 		return;
 	}
 	LOG_INF("Gyroscope bias: %.5f %.5f %.5f", (double)g_bias[0], (double)g_bias[1], (double)g_bias[2]);
-	if (sensor_calibration_validate(a_bias, g_bias, false)) {
-		set_led(SYS_LED_PATTERN_OFF, SYS_LED_PRIORITY_SENSOR);
-		LOG_INF("Restoring previous calibration");
-		LOG_INF("Gyroscope bias: %.5f %.5f %.5f", (double)gyroBias[0], (double)gyroBias[1], (double)gyroBias[2]);
-		sensor_calibration_validate(NULL, NULL, true); // additionally verify old calibration
+#if CONFIG_SENSOR_USE_TCAL
+	sys_warm_transaction_begin();
+	if (!sensor_calibration_generation_valid(generation)) {
+		sys_warm_transaction_end(false);
+		imu_cancelled(operation_id, feedback);
 		return;
-	} else {
-		LOG_INF("Applying calibration");
-		memcpy(accelBias, a_bias, sizeof(accelBias));
-		memcpy(gyroBias, g_bias, sizeof(gyroBias));
-		sensor_fusion_update_bias(NULL); // Only bias changed, preserve orientation
 	}
-#if !CONFIG_SENSOR_USE_6_SIDE_CALIBRATION
-	// In 6-side calibration mode, save accelerometer bias (full calibration matrix used elsewhere)
-	sys_write(MAIN_ACCEL_BIAS_ID, &retained->accelBias, accelBias, sizeof(accelBias));
 #endif
+	bool persist_gyro = true;
+#if CONFIG_SENSOR_USE_TCAL
+	persist_gyro = !sensor_tcal_get_auto_calibration() || isnan(avg_temp);
+#endif
+	if (feedback.session && sensor_calibration_generation_valid(generation)) {
+		sensor_calibration_result(feedback, LED_STAGE_ACK);
+	}
+	imu_step(operation_id, feedback, CAL_PHASE_APPLY_PENDING);
+	int commit_err = sensor_calibration_commit_bias(a_bias, g_bias, persist_gyro, operation_id, feedback, prior_error,
+		generation);
+	if (commit_err) {
+#if CONFIG_SENSOR_USE_TCAL
+		sys_warm_transaction_end(false);
+#endif
+		LOG_WRN("Calibration candidate rejected: %d; previous calibration unchanged", commit_err);
+		if (commit_err == -ECANCELED) {
+			imu_cancelled(operation_id, feedback);
+		} else {
+			imu_failed(operation_id, feedback, CAL_PHASE_APPLY_PENDING, CAL_REASON_CANDIDATE_REJECTED);
+		}
+		return;
+	}
 
 #if CONFIG_SENSOR_USE_TCAL
 	if (sensor_tcal_get_auto_calibration() && !isnan(avg_temp)) {
 		// Auto temperature calibration enabled: save to tcal data points only, don't change gyro bias
-		sys_write(MAIN_GYRO_TEMP_ID, &retained->gyroTemp, &avg_temp, sizeof(avg_temp));
+		int temp_err = sys_write(MAIN_GYRO_TEMP_ID, &retained->gyroTemp, &avg_temp, sizeof(avg_temp));
+		if (temp_err < 0) {
+			prior_error = temp_err;
+		}
 		LOG_INF("T-Cal auto-calibration enabled: saving to tcal data only, not updating gyro bias");
 
 		// Update temperature direction tracking for hysteresis-aware blending
@@ -168,8 +237,6 @@ void sensor_calibrate_imu(void)
 			float closest_distance = INFINITY;
 			bool has_lower_bound = false; // Point below current temp
 			bool has_upper_bound = false; // Point above current temp
-			float lower_distance = INFINITY;
-			float upper_distance = INFINITY;
 			float sampling_interval = 1.0f / CONFIG_SENSOR_POLY_STEPS_PER_DEGREE;
 
 			for (int i = 0; i < TCAL_BUFFER_SIZE; i++) {
@@ -184,22 +251,13 @@ void sensor_calibrate_imu(void)
 					// Check if this point is below or above current temp
 					if (point_temp < avg_temp) {
 						has_lower_bound = true;
-						if (distance < lower_distance) {
-							lower_distance = distance;
-						}
 					} else if (point_temp > avg_temp) {
 						has_upper_bound = true;
-						if (distance < upper_distance) {
-							upper_distance = distance;
-						}
 					}
 				}
 			}
 
-			// Coverage is good if:
-			// 1. Closest point is within sampling interval (very close match)
-			// OR
-			// 2. Has both upper and lower bounds AND closest is within 1x sampling interval
+			// Coverage is good when the closest point is within the sampling interval.
 			if (closest_distance <= sampling_interval) {
 				// Very close to existing point - definitely good coverage
 				has_good_coverage = true;
@@ -207,15 +265,6 @@ void sensor_calibrate_imu(void)
 					"T-Cal: Excellent coverage at %.2fC (closest: %.2fC away, within sampling interval)",
 					(double)avg_temp,
 					(double)closest_distance
-				);
-			} else if (has_lower_bound && has_upper_bound && closest_distance <= sampling_interval * 1.0f) {
-				// Bounded interpolation with reasonable distance
-				has_good_coverage = true;
-				LOG_INF(
-					"T-Cal: Good coverage at %.2fC (bounded: lower %.2fC, upper %.2fC)",
-					(double)avg_temp,
-					(double)lower_distance,
-					(double)upper_distance
 				);
 			} else {
 				// Log why coverage is insufficient
@@ -250,6 +299,7 @@ void sensor_calibrate_imu(void)
 			);
 			int idx = TEMP_TO_IDX(avg_temp);
 			if (idx >= 0 && idx < TCAL_BUFFER_SIZE) {
+				sensor_tcal_lock();
 
 				// Hysteresis-aware blending: prefer rising-phase data.
 				// Use tcal_current_direction directly — do not infer from temp comparison.
@@ -289,9 +339,15 @@ void sensor_calibrate_imu(void)
 				retained->tempCalPoints[idx].temp = avg_temp;
 				memcpy(retained->tempCalPoints[idx].bias, g_bias, sizeof(g_bias));
 				retained->tempCalState.valid = false; // Invalidate old curve
+				sensor_tcal_refresh_model();
+				sensor_tcal_mark_measured_bias();
+				sensor_tcal_unlock();
 				/* User-initiated: warm-mark then flush so pin-reset keeps points. */
 				update_tcal_state();
-				sys_flush_warm();
+				int warm_err = sys_flush_warm();
+				if (warm_err < 0) {
+					prior_error = warm_err;
+				}
 
 			} else {
 				LOG_WRN(
@@ -300,33 +356,33 @@ void sensor_calibrate_imu(void)
 				);
 			}
 		}
-	} else {
-		// Auto tcal not enabled or no valid temperature: save gyro bias to NVS only
-		sys_write(MAIN_GYRO_BIAS_ID, &retained->gyroBias, gyroBias, sizeof(gyroBias));
-		LOG_INF("Saving gyro bias to NVS (auto tcal not enabled)");
 	}
-#else
-	// No tcal support: always save gyro bias to NVS
-	sys_write(MAIN_GYRO_BIAS_ID, &retained->gyroBias, gyroBias, sizeof(gyroBias));
 #endif
 
-	LOG_INF("Finished calibration");
-	set_led(SYS_LED_PATTERN_ONESHOT_COMPLETE, SYS_LED_PRIORITY_SENSOR);
+#if CONFIG_SENSOR_USE_TCAL
+	sensor_calibration_record_storage_error(generation, prior_error);
+	sys_warm_transaction_end(false);
+#endif
+	LOG_INF("Calibration queued for next sensor frame");
 }
 
-#if CONFIG_SENSOR_USE_6_SIDE_CALIBRATION
-// Minimum poses required for partial calibration save (must be before sensor_calibrate_6_side)
+#if CONFIG_SENSOR_USE_ACCEL_CALIBRATION
+// Minimum poses required to save a partial accelerometer calibration.
 #define CALIB_MIN_POSES_FOR_PARTIAL 6
 
-void sensor_calibrate_6_side(void)
+void sensor_calibrate_accel(void)
 {
+	const uint16_t operation_id = sensor_calibration_current_operation();
+	const struct led_token feedback = sensor_calibration_current_feedback();
+	const uint32_t generation = sensor_calibration_current_generation();
+	bool partial = false;
 	float a_inv[4][3];
 	int captured_count = 0;
-	LOG_INF("Calibrating main accelerometer 6-side offset");
+	LOG_INF("Calibrating main accelerometer (18 orientations)");
 	LOG_INF("Rest the device on a stable surface");
 
-	sensor_calibration_clear_6_side(a_inv, false);
-	int err = sensor_6_sideBias(a_inv, &captured_count);
+	sensor_calibration_identity_accel(a_inv);
+	int err = sensor_calibration_collect_accel_poses(a_inv, &captured_count);
 	if (err) {
 		if (err == -3) {
 			// Timeout occurred - check if we have enough samples for partial calibration
@@ -334,16 +390,16 @@ void sensor_calibrate_6_side(void)
 			if (captured_count >= CALIB_MIN_POSES_FOR_PARTIAL) {
 				// We have enough samples, try to calculate calibration from partial data
 				LOG_INF("Attempting partial calibration with %d poses...", captured_count);
+				imu_step(operation_id, feedback, CAL_PHASE_FIT);
 				wait_for_threads();
-				magneto_current_calibration(a_inv, ata, norm_sum, sample_count);
+				err = magneto_current_calibration(a_inv, mag_cal_workspace.ata, norm_sum, sample_count);
 				magneto_reset();
-				// Continue to validation below - err will be handled by validate function
-				err = 0; // Clear error to allow validation
+				partial = !err;
 			} else {
 				// Not enough samples - discard and restore previous calibration
 				LOG_ERR("Insufficient poses for calibration, discarding data");
 				magneto_reset();
-				set_led(SYS_LED_PATTERN_OFF, SYS_LED_PRIORITY_SENSOR);
+				imu_failed(operation_id, feedback, CAL_PHASE_WAIT_POSE, CAL_REASON_INSUFFICIENT_SAMPLES);
 				return; // Existing calibration is preserved in accBAinv
 			}
 		} else {
@@ -351,8 +407,12 @@ void sensor_calibrate_6_side(void)
 			if (err == -1) {
 				LOG_INF("Motion detected");
 			}
-			a_inv[0][0] = NAN; // invalidate calibration
 		}
+	}
+	if (err) {
+		LOG_WRN("Accelerometer calibration failed: %d; previous calibration unchanged", err);
+		imu_failed(operation_id, feedback, CAL_PHASE_FIT, CAL_REASON_FIT_ERROR);
+		return;
 	}
 
 	if (!err) {
@@ -367,29 +427,21 @@ void sensor_calibrate_6_side(void)
 			);
 		}
 	}
-	if (sensor_calibration_validate_6_side(a_inv, false)) {
-		set_led(SYS_LED_PATTERN_OFF, SYS_LED_PRIORITY_SENSOR);
-		LOG_INF("Restoring previous calibration");
-		LOG_INF("Accelerometer matrix:");
-		for (int i = 0; i < 3; i++) {
-			LOG_INF(
-				"%.5f %.5f %.5f %.5f",
-				(double)accBAinv[0][i],
-				(double)accBAinv[1][i],
-				(double)accBAinv[2][i],
-				(double)accBAinv[3][i]
-			);
-		}
-		sensor_calibration_validate_6_side(NULL, true); // additionally verify old calibration
-		return;
-	} else {
-		LOG_INF("Applying calibration");
-		memcpy(accBAinv, a_inv, sizeof(accBAinv));
-		sensor_fusion_invalidate(); // only invalidate fusion if calibration was successful
+	if (partial) {
+		cal_event_set_completion_reason(operation_id, CAL_REASON_PARTIAL);
 	}
-	sys_write(MAIN_ACC_6_BIAS_ID, &retained->accBAinv, accBAinv, sizeof(accBAinv));
+	imu_step(operation_id, feedback, CAL_PHASE_APPLY_PENDING);
+	int commit_err = sensor_calibration_commit_accel(a_inv, operation_id, feedback, partial, generation);
+	if (commit_err) {
+		LOG_WRN("Accelerometer calibration candidate rejected: %d; previous calibration unchanged", commit_err);
+		if (commit_err == -ECANCELED) {
+			imu_cancelled(operation_id, feedback);
+		} else {
+			imu_failed(operation_id, feedback, CAL_PHASE_APPLY_PENDING, CAL_REASON_CANDIDATE_REJECTED);
+		}
+		return;
+	}
+	LOG_INF("Accelerometer calibration queued for next sensor frame");
 
-	LOG_INF("Finished calibration");
-	set_led(SYS_LED_PATTERN_ONESHOT_COMPLETE, SYS_LED_PRIORITY_SENSOR);
 }
 #endif

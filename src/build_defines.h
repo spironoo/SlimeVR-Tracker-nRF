@@ -134,10 +134,9 @@ static uint8_t get_server_constant_tracker_status(int status) __attribute__((unu
 #define FW_BOARD SVR_BOARD_GENERIC_NRF
 #endif
 
-/* NCS 3.3 renamed series Kconfig (NRF52X/NRF54LX deprecated). Keep both. */
-#if CONFIG_SOC_SERIES_NRF52X || CONFIG_SOC_SERIES_NRF52
+#if CONFIG_SOC_SERIES_NRF52
 #define FW_MCU SVR_MCU_NRF52
-#elif CONFIG_SOC_SERIES_NRF54LX || CONFIG_SOC_SERIES_NRF54L
+#elif CONFIG_SOC_SERIES_NRF54L
 #define FW_MCU SVR_MCU_NRF54L
 #else
 #define FW_MCU 0
@@ -312,7 +311,7 @@ static uint8_t get_server_constant_tracker_status(int status)
 #define BUILD_MIN   ((BUILD_TIME_IS_BAD) ? 99 :  COMPUTE_BUILD_MIN)
 #define BUILD_SEC   ((BUILD_TIME_IS_BAD) ? 99 :  COMPUTE_BUILD_SEC)
 
-#define BUILD_TIMESTAMP (((((((BUILD_YEAR - 2020) & 127) * 12 + (BUILD_MONTH & 15)) * 31 + (BUILD_DAY & 31)) * 24 + (BUILD_HOUR & 24)) * 60 + (BUILD_MIN & 60)) * 60 + (BUILD_SEC & 60))
+#define BUILD_TIMESTAMP (((((((BUILD_YEAR - 2020) & 127) * 12 + (BUILD_MONTH & 15)) * 31 + (BUILD_DAY & 31)) * 24 + (BUILD_HOUR % 24)) * 60 + (BUILD_MIN % 60)) * 60 + (BUILD_SEC % 60))
 
 #define TOSTRING(x) STRINGIFY(x)
 

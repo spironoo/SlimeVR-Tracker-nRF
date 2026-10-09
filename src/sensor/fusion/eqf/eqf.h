@@ -23,6 +23,8 @@ void eqf_update(float *g, float *a, float *m, float time);
 
 void eqf_get_gyro_bias(float *g_off);
 void eqf_set_gyro_bias(float *g_off);
+/* New gyro input = old input + delta_dps, in input-IMU axes. */
+void eqf_rebase_gyro_bias(const float delta_dps[3]);
 
 void eqf_update_gyro_sanity(float *g, float *m);
 int eqf_get_gyro_sanity(void);
@@ -31,10 +33,7 @@ void eqf_get_lin_a(float *lin_a);
 void eqf_get_quat(float *q);
 
 bool eqf_get_rest_detected(void);
-void eqf_get_relative_rest_deviations(float out[2]);
 bool eqf_get_mag_dist_detected(void);
-void eqf_reset_mag_ref(void);
-void eqf_set_mag_ref(float norm, float dip);
 void eqf_get_mag_ref(float *norm, float *dip);
 
 extern const sensor_fusion_t sensor_fusion_eqf;

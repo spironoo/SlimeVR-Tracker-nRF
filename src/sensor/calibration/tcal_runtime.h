@@ -25,6 +25,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <stddef.h>
 
 #if CONFIG_SENSOR_USE_TCAL
 
@@ -69,8 +70,39 @@ extern float tcal_direction_ref_temp;
 extern float runtime_cal_last_temp;
 
 void update_tcal_state(void);
+/* Only the sensor owner may reset/mutate directly; other threads advance a
+ * reset generation. Owner consumption never erases publication invalidation. */
 void tcal_accum_reset(void);
+void tcal_accum_request_reset(void);
+void tcal_accum_apply_reset(void);
+#if CONFIG_SENSOR_TCAL_HEATED
+/* Sensor owner, request lock held; finish is normal completion only.
+ * Confirmed bin exits stage once; start-band dwell breaks the initial hold.
+ * These APIs stage RAM points and never publish the live model. Explicit
+ * user stop publishes already staged points, discarding its unfinished bin. */
+void sensor_tcal_heated_accum_feed(const float g[3], float temp);
+void sensor_tcal_heated_accum_finish(void);
+#endif
 void sensor_tcal_runtime_init_from_retained(void);
+/* Worker command/process own allocation and publication; argv includes "tcal". */
+void sensor_tcal_backup_command(size_t argc, char **argv, uint32_t input_generation);
+void sensor_tcal_backup_process(void);
+bool sensor_tcal_backup_active(void);
+/* IRQ-safe sink: 0 ordinary editor, 1 consumed, 2 consumed and worker wake. */
+int sensor_tcal_backup_input_byte(uint8_t byte);
+uint32_t sensor_tcal_backup_input_generation(void);
+/* IRQ-safe cancellation, retired/freed by the worker. */
+void sensor_tcal_backup_input_lost(void);
+/* Caller holds the T-Cal lock across point mutation and publication. */
+void sensor_tcal_refresh_model(void);
+uint32_t sensor_tcal_reference_generation(void);
+bool sensor_tcal_take_bias_reset(void);
+void sensor_tcal_clear_doffset(void);
+void sensor_tcal_mark_measured_bias(void);
+/* Sensor owner holds the T-Cal lock; receipt follows real gyro subtraction.
+ * Reset-all cancels the deferred user receipt independently of request CLEAR. */
+void sensor_tcal_feedback_applied(uint32_t reference_generation, bool offset_applied);
+void sensor_tcal_feedback_cancel(void);
 
 /* calibration_thread entry points (were file-local) */
 int sensor_perform_boot_calibration(void);
@@ -80,9 +112,6 @@ int sensor_perform_runtime_calibration(void);
  * Public T-Cal runtime APIs remain declared in calibration.h and are defined
  * in tcal_runtime.c.
  */
-
-/* Request latch owned by calibration.c */
-int sensor_calibration_request(int id);
 
 #endif /* CONFIG_SENSOR_USE_TCAL */
 

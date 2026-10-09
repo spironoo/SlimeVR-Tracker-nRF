@@ -23,6 +23,9 @@
 #include "globals.h"
 #include "system/system.h"
 #include "system/uptime.h"
+#if CONFIG_CUSTOMER_INFO
+#include "system/customer_info.h"
+#endif
 // #include "timer.h"
 #include "connection/esb.h"
 #include "sensor/sensor.h"
@@ -67,31 +70,21 @@ int main(void)
 	bool reset_pin_reset = false;
 #else
 #ifdef NRF_RESET
-	bool reset_pin_reset = NRF_RESET->RESETREAS & RESET_RESETREAS_RESETPIN_Msk;
-	NRF_RESET->RESETREAS = NRF_RESET->RESETREAS; // Clear RESETREAS
+	bool reset_pin_reset = sys_get_reset_reason() & RESET_RESETREAS_RESETPIN_Msk;
 #else
-	bool reset_pin_reset = NRF_POWER->RESETREAS & POWER_RESETREAS_RESETPIN_Msk;
-	NRF_POWER->RESETREAS = NRF_POWER->RESETREAS; // Clear RESETREAS
+	bool reset_pin_reset = sys_get_reset_reason() & POWER_RESETREAS_RESETPIN_Msk;
 #endif
 #endif
 
-	set_led(SYS_LED_PATTERN_ON, SYS_LED_PRIORITY_BOOT); // Boot LED
+	/* Boot is not a new button input. Initialization/link/readiness owners
+	 * publish their real states without an extra startup ACK color change. */
 
 	uint8_t reboot_counter = reboot_counter_read();
 	bool booting_from_shutdown
 		= !reboot_counter && (reset_pin_reset || button_read()); // 0 means from user shutdown or failed ram validation
 
-	/* if button is not held after booting from shutdown, power off again
-	 * if button press is normal, continue boot
-	 * if button is held past the long-hold window, reset pairing only
-	 * when multiple-press actions are not enabled
-	 */
-
 	if (button_read()) {
 		while (button_read()) {
-			if (system_uptime_since_boot_ms() > 1000) {
-				set_led(SYS_LED_PATTERN_LONG, SYS_LED_PRIORITY_HIGHEST);
-			}
 			if (system_uptime_since_boot_ms() > 5000) {
 #if CONFIG_USER_EXTRA_ACTIONS
 				LOG_INF("Button long hold timeout, continuing boot");
@@ -103,18 +96,6 @@ int main(void)
 			}
 			k_msleep(1);
 		}
-#if USER_SHUTDOWN_ENABLED
-		if (system_uptime_since_boot_ms() < 50 && booting_from_shutdown) { // debounce
-			sys_request_system_off(false);
-		}
-#endif
-		if (system_uptime_since_boot_ms() <= 5000) {
-			set_led(SYS_LED_PATTERN_ONESHOT_POWERON, SYS_LED_PRIORITY_HIGHEST);
-		} else {
-			set_led(SYS_LED_PATTERN_OFF, SYS_LED_PRIORITY_HIGHEST);
-		}
-	} else if (booting_from_shutdown) {
-		set_led(SYS_LED_PATTERN_ONESHOT_POWERON, SYS_LED_PRIORITY_BOOT);
 	}
 
 	bool docked = dock_read();
@@ -156,12 +137,14 @@ int main(void)
 	}
 #endif
 
-	if (!booting_from_shutdown) { // ONESHOT_POWERON automatically sets LED off
+	if (!booting_from_shutdown) {
 		k_usleep(60);
-		set_led(SYS_LED_PATTERN_OFF, SYS_LED_PRIORITY_BOOT);
 	}
 
 	sys_reset_mode(reset_mode);
+#if CONFIG_CUSTOMER_INFO
+	customer_info_report(CUSTOMER_INFO_REPORT_LOG_SUMMARY);
+#endif
 
 	return 0;
 }
